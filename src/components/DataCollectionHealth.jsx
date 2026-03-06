@@ -133,6 +133,124 @@ Usage
   `.trim();
 }
 
+// ── Analytics Rule Health Queries ────────────────────────────────────────────
+
+function buildAnalyticsRuleHealthQuery(timeRange) {
+  return `
+SentinelHealth
+| where TimeGenerated > ago(${timeRange})
+| where SentinelResourceType == "Analytic rule"
+| summarize arg_max(TimeGenerated, Status, Description, ExtendedProperties),
+            FailureCount = countif(Status == "Failure"),
+            SuccessCount = countif(Status == "Success"),
+            TotalRuns = count()
+  by SentinelResourceName, SentinelResourceId
+| extend HealthPct = round(100.0 * SuccessCount / TotalRuns, 1)
+| project RuleName = SentinelResourceName, RuleId = SentinelResourceId,
+          LastStatus = Status, LastRun = TimeGenerated,
+          HealthPct, FailureCount, SuccessCount, TotalRuns,
+          LastDescription = Description
+| order by FailureCount desc, RuleName asc
+  `.trim();
+}
+
+function buildRuleFailureTimelineQuery(timeRange) {
+  return `
+SentinelHealth
+| where TimeGenerated > ago(${timeRange})
+| where SentinelResourceType == "Analytic rule"
+| where Status == "Failure"
+| summarize Failures = count() by bin(TimeGenerated, 1h)
+| order by TimeGenerated asc
+  `.trim();
+}
+
+// ── Data Freshness Queries ───────────────────────────────────────────────────
+
+function buildDataFreshnessQuery() {
+  return `
+Usage
+| where TimeGenerated > ago(30d)
+| where IsBillable == true
+| summarize LastLog = max(TimeGenerated),
+            AvgDailyGB = sum(Quantity) / 1024.0 / 30.0,
+            DaysWithData = dcount(bin(TimeGenerated, 1d))
+  by DataType
+| extend MinutesSinceLastLog = datetime_diff('minute', now(), LastLog)
+| extend FreshnessStatus = case(
+    MinutesSinceLastLog <= 60, 'Fresh',
+    MinutesSinceLastLog <= 1440, 'Aging',
+    MinutesSinceLastLog <= 4320, 'Stale',
+    'Critical'
+  )
+| order by MinutesSinceLastLog desc
+  `.trim();
+}
+
+// ── Ingestion Latency Queries ────────────────────────────────────────────────
+
+function buildIngestionLatencyQuery(timeRange) {
+  return `
+union withsource=TableName *
+| where TimeGenerated > ago(${timeRange})
+| where isnotempty(_TimeReceived)
+| extend LatencySeconds = datetime_diff('second', _TimeReceived, TimeGenerated)
+| where LatencySeconds >= 0 and LatencySeconds < 86400
+| summarize AvgLatencySec = avg(LatencySeconds),
+            P50Latency = percentile(LatencySeconds, 50),
+            P95Latency = percentile(LatencySeconds, 95),
+            P99Latency = percentile(LatencySeconds, 99),
+            MaxLatency = max(LatencySeconds),
+            SampleCount = count()
+  by TableName
+| where SampleCount > 10
+| order by AvgLatencySec desc
+  `.trim();
+}
+
+function buildLatencyTrendQuery(timeRange) {
+  return `
+union withsource=TableName *
+| where TimeGenerated > ago(${timeRange})
+| where isnotempty(_TimeReceived)
+| extend LatencySeconds = datetime_diff('second', _TimeReceived, TimeGenerated)
+| where LatencySeconds >= 0 and LatencySeconds < 86400
+| summarize AvgLatencySec = avg(LatencySeconds),
+            P95Latency = percentile(LatencySeconds, 95)
+  by bin(TimeGenerated, 1h)
+| order by TimeGenerated asc
+  `.trim();
+}
+
+// ── Rate Limit / Throttling Queries ──────────────────────────────────────────
+
+function buildThrottlingQuery(timeRange) {
+  return `
+Operation
+| where TimeGenerated > ago(${timeRange})
+| where OperationCategory == "Ingestion"
+| where Level == "Warning" or Level == "Error"
+| summarize EventCount = count(),
+            LastOccurrence = max(TimeGenerated)
+  by OperationKey = strcat(Detail, " | ", Solution),
+     Level, Detail, Solution
+| order by EventCount desc
+  `.trim();
+}
+
+function buildThrottlingTrendQuery(timeRange) {
+  return `
+Operation
+| where TimeGenerated > ago(${timeRange})
+| where OperationCategory == "Ingestion"
+| where Level == "Warning" or Level == "Error"
+| summarize Warnings = countif(Level == "Warning"),
+            Errors = countif(Level == "Error")
+  by bin(TimeGenerated, 1h)
+| order by TimeGenerated asc
+  `.trim();
+}
+
 // Map ARM connector kind to a friendly display name and associated tables
 const CONNECTOR_KIND_MAP = {
   'Office365': { name: 'Office 365', tables: ['OfficeActivity'] },
@@ -246,8 +364,12 @@ const STATUS_COLORS = {
 const TAB_ITEMS = [
   { id: 'overview', label: 'Overview' },
   { id: 'anomalies', label: 'Anomalies' },
-  { id: 'connectors', label: 'Connector Health' },
-  { id: 'agents', label: 'Agent Health' },
+  { id: 'freshness', label: 'Data Freshness' },
+  { id: 'latency', label: 'Latency' },
+  { id: 'rules', label: 'Rule Health' },
+  { id: 'throttling', label: 'Throttling' },
+  { id: 'connectors', label: 'Connectors' },
+  { id: 'agents', label: 'Agents' },
 ];
 
 const TIME_RANGES = [
@@ -280,6 +402,13 @@ export default function DataCollectionHealth({ darkMode }) {
   const [connectorData, setConnectorData] = useState(null);
   const [connectorTimeline, setConnectorTimeline] = useState(null);
   const [agentData, setAgentData] = useState(null);
+  const [ruleHealthData, setRuleHealthData] = useState(null);
+  const [ruleFailureTrend, setRuleFailureTrend] = useState(null);
+  const [freshnessData, setFreshnessData] = useState(null);
+  const [latencyData, setLatencyData] = useState(null);
+  const [latencyTrend, setLatencyTrend] = useState(null);
+  const [throttlingData, setThrottlingData] = useState(null);
+  const [throttlingTrend, setThrottlingTrend] = useState(null);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -438,6 +567,39 @@ export default function DataCollectionHealth({ darkMode }) {
         if (agents?.error) {
           setError('Heartbeat table is not available. This workspace may not have agents (MMA/AMA) reporting to it.');
         }
+      } else if (tab === 'rules') {
+        const [rules, trend] = await Promise.all([
+          runQuery(buildAnalyticsRuleHealthQuery(timeRange), `dch_rules_${wsKey}_${timeRange}`, { throwOnError: false }),
+          runQuery(buildRuleFailureTimelineQuery(timeRange), `dch_rulefailures_${wsKey}_${timeRange}`, { throwOnError: false }),
+        ]);
+        setRuleHealthData(rules?.error ? [] : rules);
+        setRuleFailureTrend(trend?.error ? [] : trend);
+        if (rules?.error) {
+          setError('SentinelHealth table is not available. Enable Health Monitoring in Sentinel Settings to track analytics rule health.');
+        }
+      } else if (tab === 'freshness') {
+        const freshness = await runQuery(buildDataFreshnessQuery(), `dch_freshness_${wsKey}`, { throwOnError: false });
+        setFreshnessData(freshness?.error ? [] : freshness);
+        if (freshness?.error) {
+          setError('Usage table query failed. This may be a permissions issue.');
+        }
+      } else if (tab === 'latency') {
+        const [latency, trend] = await Promise.all([
+          runQuery(buildIngestionLatencyQuery(timeRange), `dch_latency_${wsKey}_${timeRange}`, { throwOnError: false }),
+          runQuery(buildLatencyTrendQuery(timeRange), `dch_latencytrend_${wsKey}_${timeRange}`, { throwOnError: false }),
+        ]);
+        setLatencyData(latency?.error ? [] : latency);
+        setLatencyTrend(trend?.error ? [] : trend);
+        if (latency?.error) {
+          setError('Latency data not available. The _TimeReceived field may not be present in all tables.');
+        }
+      } else if (tab === 'throttling') {
+        const [throttle, trend] = await Promise.all([
+          runQuery(buildThrottlingQuery(timeRange), `dch_throttle_${wsKey}_${timeRange}`, { throwOnError: false }),
+          runQuery(buildThrottlingTrendQuery(timeRange), `dch_throttletrend_${wsKey}_${timeRange}`, { throwOnError: false }),
+        ]);
+        setThrottlingData(throttle?.error ? [] : throttle);
+        setThrottlingTrend(trend?.error ? [] : trend);
       }
       setLastRefresh(new Date());
     } catch (err) {
@@ -479,6 +641,13 @@ export default function DataCollectionHealth({ darkMode }) {
     setConnectorData(null);
     setConnectorTimeline(null);
     setAgentData(null);
+    setRuleHealthData(null);
+    setRuleFailureTrend(null);
+    setFreshnessData(null);
+    setLatencyData(null);
+    setLatencyTrend(null);
+    setThrottlingData(null);
+    setThrottlingTrend(null);
     setError(null);
   };
 
@@ -692,12 +861,12 @@ export default function DataCollectionHealth({ darkMode }) {
       </div>
 
       {/* Tabs */}
-      <div className={`flex gap-1 p-1 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+      <div className={`flex gap-1 p-1 rounded-lg overflow-x-auto ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
         {TAB_ITEMS.map(tab => (
           <button
             key={tab.id}
             onClick={() => handleTabChange(tab.id)}
-            className={`flex-1 px-4 py-2 text-sm font-medium rounded-md transition-colors ${
+            className={`px-3 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
               activeTab === tab.id
                 ? darkMode
                   ? 'bg-gray-700 text-white'
@@ -755,6 +924,25 @@ export default function DataCollectionHealth({ darkMode }) {
             />}
             {activeTab === 'agents' && <AgentsTab
               agentData={agentData} darkMode={darkMode} cardClass={cardClass}
+              textPrimary={textPrimary} textSecondary={textSecondary} textMuted={textMuted}
+            />}
+            {activeTab === 'rules' && <RuleHealthTab
+              ruleHealthData={ruleHealthData} ruleFailureTrend={ruleFailureTrend}
+              darkMode={darkMode} cardClass={cardClass}
+              textPrimary={textPrimary} textSecondary={textSecondary} textMuted={textMuted}
+            />}
+            {activeTab === 'freshness' && <FreshnessTab
+              freshnessData={freshnessData} darkMode={darkMode} cardClass={cardClass}
+              textPrimary={textPrimary} textSecondary={textSecondary} textMuted={textMuted}
+            />}
+            {activeTab === 'latency' && <LatencyTab
+              latencyData={latencyData} latencyTrend={latencyTrend}
+              darkMode={darkMode} cardClass={cardClass}
+              textPrimary={textPrimary} textSecondary={textSecondary} textMuted={textMuted}
+            />}
+            {activeTab === 'throttling' && <ThrottlingTab
+              throttlingData={throttlingData} throttlingTrend={throttlingTrend}
+              darkMode={darkMode} cardClass={cardClass}
               textPrimary={textPrimary} textSecondary={textSecondary} textMuted={textMuted}
             />}
           </motion.div>
@@ -1212,6 +1400,399 @@ function KpiCard({ label, value, subtitle, color, darkMode, cardClass, textPrima
     </div>
   );
 }
+
+// ── Rule Health Tab ──────────────────────────────────────────────────────────
+
+function RuleHealthTab({ ruleHealthData, ruleFailureTrend, darkMode, cardClass, textPrimary, textSecondary, textMuted }) {
+  if (!ruleHealthData) {
+    return <EmptyState message="Click 'Load Data' to view analytics rule health." darkMode={darkMode} />;
+  }
+
+  const totalRules = ruleHealthData.length;
+  const failingRules = ruleHealthData.filter(r => parseInt(r.FailureCount) > 0);
+  const healthyRules = ruleHealthData.filter(r => parseInt(r.FailureCount) === 0);
+  const avgHealth = totalRules > 0
+    ? (ruleHealthData.reduce((sum, r) => sum + (parseFloat(r.HealthPct) || 0), 0) / totalRules).toFixed(1)
+    : '—';
+
+  const failureTrendData = (ruleFailureTrend || []).map(r => ({
+    time: new Date(r.TimeGenerated).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit' }),
+    failures: parseInt(r.Failures) || 0,
+  }));
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <KpiCard label="Rules Tracked" value={totalRules} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Healthy" value={healthyRules.length} color="#10b981" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="With Failures" value={failingRules.length} color={failingRules.length > 0 ? '#ef4444' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Avg Health" value={`${avgHealth}%`} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+      </div>
+
+      {/* Failure trend chart */}
+      {failureTrendData.length > 0 && (
+        <div className={`${cardClass} p-5`}>
+          <h3 className={`text-sm font-semibold mb-4 ${textPrimary}`}>Rule Failures Over Time</h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={failureTrendData}>
+              <CartesianGrid strokeDasharray="3 3" stroke={darkMode ? '#374151' : '#e5e7eb'} />
+              <XAxis dataKey="time" tick={{ fontSize: 10, fill: darkMode ? '#9ca3af' : '#6b7280' }} interval="preserveStartEnd" />
+              <YAxis tick={{ fontSize: 11, fill: darkMode ? '#9ca3af' : '#6b7280' }} allowDecimals={false} />
+              <Tooltip contentStyle={{ backgroundColor: darkMode ? '#1f2937' : '#fff', border: `1px solid ${darkMode ? '#374151' : '#e5e7eb'}`, borderRadius: '8px' }} />
+              <Bar dataKey="failures" fill="#ef4444" name="Failures" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {totalRules === 0 ? (
+        <div className={`${cardClass} p-8 text-center`}>
+          <p className={`font-medium ${textPrimary}`}>No Analytics Rule Health Data</p>
+          <p className={`text-sm mt-1 ${textSecondary}`}>Enable Health Monitoring in Sentinel Settings to track rule execution health.</p>
+        </div>
+      ) : (
+        <div className={`${cardClass} p-5`}>
+          <h3 className={`text-sm font-semibold mb-4 ${textPrimary}`}>
+            Analytics Rules ({totalRules})
+            {failingRules.length > 0 && <span className="ml-2 text-red-400 text-xs font-normal">({failingRules.length} with failures)</span>}
+          </h3>
+          <div className="overflow-x-auto max-h-[500px] overflow-y-auto">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0">
+                <tr className={`border-b ${darkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Rule Name</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Status</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Health %</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Runs</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Failures</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Last Run</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ruleHealthData.map((row, i) => {
+                  const healthPct = parseFloat(row.HealthPct) || 0;
+                  const failures = parseInt(row.FailureCount) || 0;
+                  const statusColor = healthPct >= 95 ? STATUS_COLORS.Healthy : healthPct >= 50 ? STATUS_COLORS.Warning : STATUS_COLORS.Critical;
+                  return (
+                    <tr key={i} className={`border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-100'}`}>
+                      <td className={`py-2 px-3 font-medium ${textPrimary}`}>{row.RuleName}</td>
+                      <td className="py-2 px-3">
+                        <span className="flex items-center gap-2">
+                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: statusColor }} />
+                          <span className={textSecondary}>{row.LastStatus || 'Unknown'}</span>
+                        </span>
+                      </td>
+                      <td className={`py-2 px-3 text-right font-medium`} style={{ color: statusColor }}>{healthPct}%</td>
+                      <td className={`py-2 px-3 text-right ${textSecondary}`}>{row.TotalRuns}</td>
+                      <td className={`py-2 px-3 text-right ${failures > 0 ? 'text-red-400 font-medium' : textMuted}`}>{failures}</td>
+                      <td className={`py-2 px-3 ${textMuted}`}>{timeAgo(row.LastRun)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {failingRules.length > 0 && (
+            <div className={`mt-4 p-3 rounded-lg ${darkMode ? 'bg-red-500/10 border border-red-500/20' : 'bg-red-50 border border-red-200'}`}>
+              <p className="text-red-400 text-xs font-medium">Failing rules may not be generating alerts. Review and fix these rules in Sentinel to avoid missed detections.</p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Data Freshness Tab ───────────────────────────────────────────────────────
+
+function FreshnessTab({ freshnessData, darkMode, cardClass, textPrimary, textSecondary, textMuted }) {
+  if (!freshnessData) {
+    return <EmptyState message="Click 'Load Data' to check data freshness across all tables." darkMode={darkMode} />;
+  }
+
+  const fresh = freshnessData.filter(r => r.FreshnessStatus === 'Fresh');
+  const aging = freshnessData.filter(r => r.FreshnessStatus === 'Aging');
+  const stale = freshnessData.filter(r => r.FreshnessStatus === 'Stale');
+  const critical = freshnessData.filter(r => r.FreshnessStatus === 'Critical');
+
+  const FRESHNESS_COLORS = { Fresh: '#10b981', Aging: '#3b82f6', Stale: '#f59e0b', Critical: '#ef4444' };
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <KpiCard label="Total Tables" value={freshnessData.length} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Fresh (<1h)" value={fresh.length} color="#10b981" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Aging (1-24h)" value={aging.length} color="#3b82f6" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Stale (1-3d)" value={stale.length} color="#f59e0b" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Critical (>3d)" value={critical.length} color={critical.length > 0 ? '#ef4444' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+      </div>
+
+      {freshnessData.length === 0 ? (
+        <div className={`${cardClass} p-8 text-center`}>
+          <p className={`font-medium ${textPrimary}`}>No Usage Data</p>
+          <p className={`text-sm mt-1 ${textSecondary}`}>No billable tables found in this workspace.</p>
+        </div>
+      ) : (
+        <div className={`${cardClass} p-5`}>
+          <h3 className={`text-sm font-semibold mb-4 ${textPrimary}`}>Table Freshness ({freshnessData.length} tables)</h3>
+          <div className="overflow-x-auto max-h-[500px] overflow-y-auto">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0">
+                <tr className={`border-b ${darkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Data Type</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Status</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Last Log</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Time Since</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Avg Daily Vol</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Active Days</th>
+                </tr>
+              </thead>
+              <tbody>
+                {freshnessData.map((row, i) => {
+                  const statusColor = FRESHNESS_COLORS[row.FreshnessStatus] || '#6b7280';
+                  const mins = parseInt(row.MinutesSinceLastLog) || 0;
+                  const timeSince = mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins/60)}h ${mins%60}m` : `${Math.floor(mins/1440)}d ${Math.floor((mins%1440)/60)}h`;
+                  return (
+                    <tr key={i} className={`border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-100'}`}>
+                      <td className={`py-2 px-3 font-medium ${textPrimary}`}>{row.DataType}</td>
+                      <td className="py-2 px-3">
+                        <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium`}
+                          style={{ backgroundColor: `${statusColor}20`, color: statusColor }}>
+                          <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: statusColor }} />
+                          {row.FreshnessStatus}
+                        </span>
+                      </td>
+                      <td className={`py-2 px-3 ${textMuted}`}>{new Date(row.LastLog).toLocaleString()}</td>
+                      <td className={`py-2 px-3 text-right font-mono text-xs`} style={{ color: statusColor }}>{timeSince}</td>
+                      <td className={`py-2 px-3 text-right ${textSecondary}`}>{formatBytes(parseFloat(row.AvgDailyGB) || 0)}</td>
+                      <td className={`py-2 px-3 text-right ${textSecondary}`}>{row.DaysWithData}/30</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {(stale.length > 0 || critical.length > 0) && (
+            <div className={`mt-4 p-3 rounded-lg ${darkMode ? 'bg-yellow-500/10 border border-yellow-500/20' : 'bg-yellow-50 border border-yellow-200'}`}>
+              <p className="text-yellow-400 text-xs font-medium">
+                {stale.length + critical.length} table(s) have not received data recently. This may indicate a silent connector failure — data is not flowing but no error is reported.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Latency Tab ──────────────────────────────────────────────────────────────
+
+function LatencyTab({ latencyData, latencyTrend, darkMode, cardClass, textPrimary, textSecondary, textMuted }) {
+  if (!latencyData) {
+    return <EmptyState message="Click 'Load Data' to measure ingestion latency." darkMode={darkMode} />;
+  }
+
+  const highLatency = latencyData.filter(r => parseFloat(r.AvgLatencySec) > 300); // > 5 min avg
+  const overallAvg = latencyData.length > 0
+    ? (latencyData.reduce((sum, r) => sum + (parseFloat(r.AvgLatencySec) || 0), 0) / latencyData.length)
+    : 0;
+  const worstTable = latencyData[0];
+
+  const trendChartData = (latencyTrend || []).map(r => ({
+    time: new Date(r.TimeGenerated).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit' }),
+    avg: Math.round(parseFloat(r.AvgLatencySec) || 0),
+    p95: Math.round(parseFloat(r.P95Latency) || 0),
+  }));
+
+  function formatLatency(seconds) {
+    if (seconds == null || isNaN(seconds)) return '—';
+    seconds = Math.round(seconds);
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds/60)}m ${seconds%60}s`;
+    return `${Math.floor(seconds/3600)}h ${Math.floor((seconds%3600)/60)}m`;
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <KpiCard label="Tables Measured" value={latencyData.length} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Overall Avg Latency" value={formatLatency(overallAvg)} color={overallAvg > 300 ? '#f59e0b' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="High Latency Tables" value={highLatency.length} color={highLatency.length > 0 ? '#ef4444' : '#10b981'} subtitle=">5 min avg" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Worst Table" value={worstTable?.TableName || '—'} subtitle={worstTable ? formatLatency(parseFloat(worstTable.AvgLatencySec)) : ''} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+      </div>
+
+      {/* Latency trend chart */}
+      {trendChartData.length > 0 && (
+        <div className={`${cardClass} p-5`}>
+          <h3 className={`text-sm font-semibold mb-4 ${textPrimary}`}>Ingestion Latency Trend (All Tables)</h3>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={trendChartData}>
+              <CartesianGrid strokeDasharray="3 3" stroke={darkMode ? '#374151' : '#e5e7eb'} />
+              <XAxis dataKey="time" tick={{ fontSize: 10, fill: darkMode ? '#9ca3af' : '#6b7280' }} interval="preserveStartEnd" />
+              <YAxis tick={{ fontSize: 11, fill: darkMode ? '#9ca3af' : '#6b7280' }} tickFormatter={v => `${v}s`} />
+              <Tooltip contentStyle={{ backgroundColor: darkMode ? '#1f2937' : '#fff', border: `1px solid ${darkMode ? '#374151' : '#e5e7eb'}`, borderRadius: '8px' }}
+                formatter={(val) => [`${val}s`, undefined]} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Line type="monotone" dataKey="avg" stroke="#3b82f6" strokeWidth={2} dot={false} name="Average" />
+              <Line type="monotone" dataKey="p95" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="P95" strokeDasharray="4 2" />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {latencyData.length === 0 ? (
+        <div className={`${cardClass} p-8 text-center`}>
+          <p className={`font-medium ${textPrimary}`}>No Latency Data</p>
+          <p className={`text-sm mt-1 ${textSecondary}`}>The _TimeReceived field is not available or no data matched in this time range.</p>
+        </div>
+      ) : (
+        <div className={`${cardClass} p-5`}>
+          <h3 className={`text-sm font-semibold mb-4 ${textPrimary}`}>Latency by Table</h3>
+          <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0">
+                <tr className={`border-b ${darkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Table</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Avg</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>P50</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>P95</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>P99</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Max</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Samples</th>
+                </tr>
+              </thead>
+              <tbody>
+                {latencyData.map((row, i) => {
+                  const avg = parseFloat(row.AvgLatencySec) || 0;
+                  const color = avg > 600 ? '#ef4444' : avg > 300 ? '#f59e0b' : avg > 60 ? '#3b82f6' : '#10b981';
+                  return (
+                    <tr key={i} className={`border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-100'}`}>
+                      <td className={`py-2 px-3 font-medium ${textPrimary}`}>{row.TableName}</td>
+                      <td className={`py-2 px-3 text-right font-medium`} style={{ color }}>{formatLatency(avg)}</td>
+                      <td className={`py-2 px-3 text-right ${textSecondary}`}>{formatLatency(parseFloat(row.P50Latency))}</td>
+                      <td className={`py-2 px-3 text-right ${textSecondary}`}>{formatLatency(parseFloat(row.P95Latency))}</td>
+                      <td className={`py-2 px-3 text-right ${textSecondary}`}>{formatLatency(parseFloat(row.P99Latency))}</td>
+                      <td className={`py-2 px-3 text-right ${textMuted}`}>{formatLatency(parseFloat(row.MaxLatency))}</td>
+                      <td className={`py-2 px-3 text-right ${textMuted}`}>{formatNumber(parseInt(row.SampleCount))}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {highLatency.length > 0 && (
+            <div className={`mt-4 p-3 rounded-lg ${darkMode ? 'bg-yellow-500/10 border border-yellow-500/20' : 'bg-yellow-50 border border-yellow-200'}`}>
+              <p className="text-yellow-400 text-xs font-medium">
+                {highLatency.length} table(s) have average ingestion latency over 5 minutes. High latency means events are being seen late, directly impacting detection and response times.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Throttling Tab ───────────────────────────────────────────────────────────
+
+function ThrottlingTab({ throttlingData, throttlingTrend, darkMode, cardClass, textPrimary, textSecondary, textMuted }) {
+  if (!throttlingData) {
+    return <EmptyState message="Click 'Load Data' to check for ingestion rate limits and throttling." darkMode={darkMode} />;
+  }
+
+  const warnings = throttlingData.filter(r => r.Level === 'Warning');
+  const errors = throttlingData.filter(r => r.Level === 'Error');
+  const totalEvents = throttlingData.reduce((sum, r) => sum + (parseInt(r.EventCount) || 0), 0);
+
+  const trendChartData = (throttlingTrend || []).map(r => ({
+    time: new Date(r.TimeGenerated).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit' }),
+    warnings: parseInt(r.Warnings) || 0,
+    errors: parseInt(r.Errors) || 0,
+  }));
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <KpiCard label="Issue Types" value={throttlingData.length} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Total Events" value={formatNumber(totalEvents)} color={totalEvents > 0 ? '#f59e0b' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Warnings" value={warnings.length} color={warnings.length > 0 ? '#f59e0b' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Errors" value={errors.length} color={errors.length > 0 ? '#ef4444' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+      </div>
+
+      {/* Trend chart */}
+      {trendChartData.length > 0 && (
+        <div className={`${cardClass} p-5`}>
+          <h3 className={`text-sm font-semibold mb-4 ${textPrimary}`}>Throttling Events Over Time</h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={trendChartData}>
+              <CartesianGrid strokeDasharray="3 3" stroke={darkMode ? '#374151' : '#e5e7eb'} />
+              <XAxis dataKey="time" tick={{ fontSize: 10, fill: darkMode ? '#9ca3af' : '#6b7280' }} interval="preserveStartEnd" />
+              <YAxis tick={{ fontSize: 11, fill: darkMode ? '#9ca3af' : '#6b7280' }} allowDecimals={false} />
+              <Tooltip contentStyle={{ backgroundColor: darkMode ? '#1f2937' : '#fff', border: `1px solid ${darkMode ? '#374151' : '#e5e7eb'}`, borderRadius: '8px' }} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Bar dataKey="warnings" fill="#f59e0b" stackId="a" name="Warnings" />
+              <Bar dataKey="errors" fill="#ef4444" stackId="a" name="Errors" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {throttlingData.length === 0 ? (
+        <div className={`${cardClass} p-8 text-center`}>
+          <div className="text-4xl mb-3">&#10003;</div>
+          <p className={`font-medium ${textPrimary}`}>No Throttling Issues</p>
+          <p className={`text-sm mt-1 ${textSecondary}`}>No ingestion warnings or errors found in this time range. Data is flowing without rate limit issues.</p>
+        </div>
+      ) : (
+        <div className={`${cardClass} p-5`}>
+          <h3 className={`text-sm font-semibold mb-4 ${textPrimary}`}>Ingestion Issues ({throttlingData.length})</h3>
+          <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0">
+                <tr className={`border-b ${darkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Level</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Detail</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Solution</th>
+                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Count</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Last Seen</th>
+                </tr>
+              </thead>
+              <tbody>
+                {throttlingData.map((row, i) => {
+                  const isError = row.Level === 'Error';
+                  return (
+                    <tr key={i} className={`border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-100'}`}>
+                      <td className="py-2 px-3">
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                          isError ? 'bg-red-500/10 text-red-400' : 'bg-yellow-500/10 text-yellow-400'
+                        }`}>
+                          {row.Level}
+                        </span>
+                      </td>
+                      <td className={`py-2 px-3 ${textPrimary} max-w-md`}>
+                        <p className="truncate" title={row.Detail}>{row.Detail || '—'}</p>
+                      </td>
+                      <td className={`py-2 px-3 ${textSecondary}`}>{row.Solution || '—'}</td>
+                      <td className={`py-2 px-3 text-right font-medium ${isError ? 'text-red-400' : 'text-yellow-400'}`}>{row.EventCount}</td>
+                      <td className={`py-2 px-3 ${textMuted}`}>{timeAgo(row.LastOccurrence)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className={`mt-4 p-3 rounded-lg ${darkMode ? 'bg-red-500/10 border border-red-500/20' : 'bg-red-50 border border-red-200'}`}>
+            <p className="text-red-400 text-xs font-medium">
+              Ingestion throttling means data may be dropped or delayed. Consider increasing the workspace daily cap or optimizing high-volume data sources.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Shared Components ────────────────────────────────────────────────────────
 
 function EmptyState({ message, darkMode }) {
   return (
