@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -373,6 +373,61 @@ function setCache(key, data) {
   } catch { /* ignore */ }
 }
 
+// ── Executive Health Summary Query (one per workspace) ───────────────────────
+
+function buildExecutiveHealthQuery() {
+  return `
+let ingestion = Usage
+| where TimeGenerated > ago(24h)
+| where IsBillable == true
+| summarize VolumeGB_24h = round(sum(Quantity) / 1024.0, 2), TableCount = dcount(DataType);
+let ruleHealth = SentinelHealth
+| where TimeGenerated > ago(24h)
+| where SentinelResourceType == "Analytics Rule"
+| summarize RuleFailures = countif(Status == "Failure"), RuleRuns = count(), RulesTracked = dcount(SentinelResourceName);
+let connHealth = SentinelHealth
+| where TimeGenerated > ago(24h)
+| where SentinelResourceType == "Data connector"
+| summarize ConnFailures = countif(Status == "Failure"), ConnTotal = dcount(SentinelResourceName);
+let staleTables = Usage
+| where TimeGenerated > ago(30d)
+| where IsBillable == true
+| summarize LastSeen = max(TimeGenerated) by DataType
+| where datetime_diff('hour', now(), LastSeen) > 24
+| summarize StaleTables = count();
+ingestion | extend p=1
+| join kind=fullouter (ruleHealth | extend p=1) on p
+| join kind=fullouter (connHealth | extend p=1) on p
+| join kind=fullouter (staleTables | extend p=1) on p
+| project VolumeGB_24h, TableCount, RuleFailures, RuleRuns, RulesTracked, ConnFailures, ConnTotal, StaleTables
+  `.trim();
+}
+
+function computeOverallHealth(data) {
+  if (!data) return { score: 0, status: 'Unknown', color: '#6b7280' };
+  const ruleFailures = parseInt(data.RuleFailures) || 0;
+  const ruleRuns = parseInt(data.RuleRuns) || 0;
+  const connFailures = parseInt(data.ConnFailures) || 0;
+  const staleTables = parseInt(data.StaleTables) || 0;
+  const volumeGB = parseFloat(data.VolumeGB_24h) || 0;
+
+  // No ingestion at all = critical
+  if (volumeGB === 0) return { score: 0, status: 'Critical', color: '#ef4444' };
+
+  let score = 100;
+  // Rule health penalty
+  if (ruleRuns > 0) score -= Math.min(30, (ruleFailures / ruleRuns) * 300);
+  // Connector failure penalty
+  if (connFailures > 0) score -= Math.min(20, connFailures * 10);
+  // Stale table penalty
+  score -= Math.min(20, staleTables * 5);
+
+  score = Math.max(0, Math.round(score));
+  if (score >= 90) return { score, status: 'Healthy', color: '#10b981' };
+  if (score >= 70) return { score, status: 'Warning', color: '#f59e0b' };
+  return { score, status: 'Critical', color: '#ef4444' };
+}
+
 const STATUS_COLORS = {
   Healthy: '#10b981',
   Warning: '#f59e0b',
@@ -382,6 +437,7 @@ const STATUS_COLORS = {
 };
 
 const TAB_ITEMS = [
+  { id: 'executive', label: 'All Clients' },
   { id: 'overview', label: 'Overview' },
   { id: 'anomalies', label: 'Anomalies' },
   { id: 'freshness', label: 'Data Freshness' },
@@ -411,8 +467,12 @@ export default function DataCollectionHealth({ darkMode }) {
   const [selectedWorkspace, setSelectedWorkspace] = useState(null);
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
 
-  const [activeTab, setActiveTab] = useState('overview');
+  const [activeTab, setActiveTab] = useState('executive');
   const [timeRange, setTimeRange] = useState('7d');
+
+  // Executive overview state (all-client scan)
+  const [execHealthData, setExecHealthData] = useState({});  // { workspaceId: { data, loading, error } }
+  const [execScanning, setExecScanning] = useState(false);
 
   // Data states
   const [ingestionData, setIngestionData] = useState(null);
@@ -468,8 +528,44 @@ export default function DataCollectionHealth({ darkMode }) {
     }
   }, [fetchFromLogAnalytics, selectedWorkspace]);
 
+  // Executive scan — runs health query against all workspaces in parallel
+  const scanAllWorkspaces = useCallback(async (wsList) => {
+    if (!wsList?.length) return;
+    setExecScanning(true);
+    const query = buildExecutiveHealthQuery();
+
+    // Process in batches of 5 to avoid overwhelming the API
+    const batchSize = 5;
+    for (let i = 0; i < wsList.length; i += batchSize) {
+      const batch = wsList.slice(i, i + batchSize);
+      const promises = batch.map(async (ws) => {
+        const cacheKey = `dch_exec_${ws.customerId}`;
+        const cached = getCached(cacheKey);
+        if (cached) {
+          setExecHealthData(prev => ({ ...prev, [ws.customerId]: { data: cached[0] || {}, loading: false, error: null } }));
+          return;
+        }
+        setExecHealthData(prev => ({ ...prev, [ws.customerId]: { data: null, loading: true, error: null } }));
+        try {
+          const result = await fetchFromLogAnalytics(ws.customerId, query);
+          const rows = parseLogAnalyticsRows(result);
+          setCache(cacheKey, rows);
+          setExecHealthData(prev => ({ ...prev, [ws.customerId]: { data: rows[0] || {}, loading: false, error: null } }));
+        } catch (err) {
+          setExecHealthData(prev => ({ ...prev, [ws.customerId]: { data: null, loading: false, error: err.message } }));
+        }
+      });
+      await Promise.all(promises);
+    }
+    setExecScanning(false);
+  }, [fetchFromLogAnalytics]);
+
   // Fetch tab data
   const fetchData = useCallback(async (tab) => {
+    if (tab === 'executive') {
+      if (workspaces.length > 0) scanAllWorkspaces(workspaces);
+      return;
+    }
     if (!selectedWorkspace) return;
     setLoading(true);
     setError(null);
@@ -808,6 +904,21 @@ export default function DataCollectionHealth({ darkMode }) {
     // Data will be refreshed when user clicks Load or via effect
   };
 
+  // Auto-load workspaces on mount, then auto-scan
+  const hasAutoScanned = useRef(false);
+  useEffect(() => {
+    if (isAuthenticated && !workspaces.length && !loadingWorkspaces) {
+      loadWorkspaces();
+    }
+  }, [isAuthenticated, loadWorkspaces, workspaces.length, loadingWorkspaces]);
+
+  useEffect(() => {
+    if (workspaces.length > 0 && !hasAutoScanned.current && Object.keys(execHealthData).length === 0) {
+      hasAutoScanned.current = true;
+      scanAllWorkspaces(workspaces);
+    }
+  }, [workspaces, scanAllWorkspaces, execHealthData]);
+
   // ── Computed values ────────────────────────────────────────────────────────
 
   const totalVolumeGB = useMemo(() => {
@@ -896,64 +1007,22 @@ export default function DataCollectionHealth({ darkMode }) {
     );
   }
 
-  // ── Workspace selector ─────────────────────────────────────────────────────
+  // ── Drill-down handler ─────────────────────────────────────────────────────
 
-  if (!selectedWorkspace) {
-    return (
-      <div className="space-y-6">
-        <div>
-          <h2 className={`text-xl font-semibold ${textPrimary}`}>Data Collection Health Monitor</h2>
-          <p className={`text-sm mt-1 ${textSecondary}`}>
-            Monitor ingestion volume, detect anomalies, and track connector and agent health.
-          </p>
-        </div>
+  const handleDrillDown = (ws) => {
+    handleWorkspaceSelect(ws);
+    setActiveTab('overview');
+    // fetchData will be triggered by the tab change effect
+  };
 
-        {!workspaces.length && !loadingWorkspaces && (
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={loadWorkspaces}
-            className="px-6 py-2.5 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition-colors"
-          >
-            Load Sentinel Workspaces
-          </motion.button>
-        )}
+  const handleBackToExecutive = () => {
+    setSelectedWorkspace(null);
+    setActiveTab('executive');
+    setError(null);
+  };
 
-        {loadingWorkspaces && (
-          <div className={`flex items-center gap-3 ${textSecondary}`}>
-            <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-blue-500" />
-            <span>Discovering Sentinel workspaces...</span>
-          </div>
-        )}
-
-        {workspaces.length > 0 && (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {workspaces.map(ws => (
-              <motion.button
-                key={ws.id}
-                whileHover={{ scale: 1.01 }}
-                whileTap={{ scale: 0.99 }}
-                onClick={() => handleWorkspaceSelect(ws)}
-                className={`text-left p-4 rounded-lg border transition-colors ${
-                  darkMode
-                    ? 'bg-gray-800 border-gray-700 hover:border-blue-500'
-                    : 'bg-white border-gray-200 hover:border-blue-400'
-                }`}
-              >
-                <div className={`font-medium ${textPrimary}`}>{ws.name}</div>
-                <div className={`text-xs mt-1 ${textMuted}`}>{ws.subscriptionName}</div>
-                <div className={`text-xs ${textMuted}`}>{ws.location}</div>
-              </motion.button>
-            ))}
-          </div>
-        )}
-
-        {error && (
-          <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">{error}</div>
-        )}
-      </div>
-    );
-  }
+  // Determine if detail tabs should be available
+  const isDetailTab = activeTab !== 'executive';
 
   // ── Main dashboard ─────────────────────────────────────────────────────────
 
@@ -964,73 +1033,110 @@ export default function DataCollectionHealth({ darkMode }) {
         <div>
           <h2 className={`text-xl font-semibold ${textPrimary}`}>Data Collection Health Monitor</h2>
           <p className={`text-sm mt-1 ${textSecondary}`}>
-            {selectedWorkspace.name}
-            <button
-              onClick={() => { setSelectedWorkspace(null); setError(null); }}
-              className="ml-2 text-blue-500 hover:text-blue-400 text-xs"
-            >
-              (change)
-            </button>
+            {activeTab === 'executive' ? (
+              'All client workspaces at a glance'
+            ) : selectedWorkspace ? (
+              <>
+                {selectedWorkspace.name}
+                <button onClick={handleBackToExecutive} className="ml-2 text-blue-500 hover:text-blue-400 text-xs">(all clients)</button>
+              </>
+            ) : (
+              <span>Select a client from the All Clients tab to view details</span>
+            )}
           </p>
         </div>
         <div className="flex items-center gap-3">
-          {/* Time Range Selector */}
-          <select
-            value={timeRange}
-            onChange={(e) => handleTimeRangeChange(e.target.value)}
-            className={`text-sm rounded-lg px-3 py-1.5 border ${
-              darkMode
-                ? 'bg-gray-800 border-gray-700 text-white'
-                : 'bg-white border-gray-200 text-gray-900'
-            }`}
-          >
-            {TIME_RANGES.map(r => (
-              <option key={r.value} value={r.value}>{r.label}</option>
-            ))}
-          </select>
+          {activeTab === 'executive' ? (
+            <>
+              {!workspaces.length && !loadingWorkspaces && (
+                <motion.button
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={async () => { const ws = await loadWorkspaces(); }}
+                  className="px-4 py-1.5 bg-blue-600 text-white text-sm rounded-lg font-medium hover:bg-blue-700 transition-colors"
+                >
+                  Load Workspaces
+                </motion.button>
+              )}
+              {workspaces.length > 0 && (
+                <motion.button
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={() => scanAllWorkspaces(workspaces)}
+                  disabled={execScanning}
+                  className="px-4 py-1.5 bg-blue-600 text-white text-sm rounded-lg font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+                >
+                  {execScanning ? 'Scanning...' : Object.keys(execHealthData).length > 0 ? 'Rescan All' : 'Scan All Clients'}
+                </motion.button>
+              )}
+            </>
+          ) : (
+            <>
+              {/* Time Range Selector */}
+              <select
+                value={timeRange}
+                onChange={(e) => handleTimeRangeChange(e.target.value)}
+                className={`text-sm rounded-lg px-3 py-1.5 border ${
+                  darkMode
+                    ? 'bg-gray-800 border-gray-700 text-white'
+                    : 'bg-white border-gray-200 text-gray-900'
+                }`}
+              >
+                {TIME_RANGES.map(r => (
+                  <option key={r.value} value={r.value}>{r.label}</option>
+                ))}
+              </select>
 
-          {/* Load / Refresh */}
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={() => fetchData(activeTab)}
-            disabled={loading}
-            className="px-4 py-1.5 bg-blue-600 text-white text-sm rounded-lg font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
-          >
-            {loading ? 'Loading...' : lastRefresh ? 'Refresh' : 'Load Data'}
-          </motion.button>
+              {/* Load / Refresh */}
+              <motion.button
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => fetchData(activeTab)}
+                disabled={loading || !selectedWorkspace}
+                className="px-4 py-1.5 bg-blue-600 text-white text-sm rounded-lg font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+              >
+                {loading ? 'Loading...' : lastRefresh ? 'Refresh' : 'Load Data'}
+              </motion.button>
 
-          {lastRefresh && !loading && (
-            <button
-              onClick={handleRefresh}
-              className={`text-xs ${textMuted} hover:text-blue-500`}
-              title="Force refresh (clear cache)"
-            >
-              Force Refresh
-            </button>
+              {lastRefresh && !loading && (
+                <button
+                  onClick={handleRefresh}
+                  className={`text-xs ${textMuted} hover:text-blue-500`}
+                  title="Force refresh (clear cache)"
+                >
+                  Force Refresh
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>
 
       {/* Tabs */}
       <div className={`flex gap-1 p-1 rounded-lg overflow-x-auto ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
-        {TAB_ITEMS.map(tab => (
-          <button
-            key={tab.id}
-            onClick={() => handleTabChange(tab.id)}
-            className={`px-3 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
-              activeTab === tab.id
-                ? darkMode
-                  ? 'bg-gray-700 text-white'
-                  : 'bg-white text-gray-900 shadow-sm'
-                : darkMode
-                ? 'text-gray-400 hover:text-gray-200'
-                : 'text-gray-600 hover:text-gray-900'
-            }`}
-          >
-            {tab.label}
-          </button>
-        ))}
+        {TAB_ITEMS.map(tab => {
+          const isDisabled = tab.id !== 'executive' && !selectedWorkspace;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => !isDisabled && handleTabChange(tab.id)}
+              disabled={isDisabled}
+              className={`px-3 py-2 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
+                activeTab === tab.id
+                  ? darkMode
+                    ? 'bg-gray-700 text-white'
+                    : 'bg-white text-gray-900 shadow-sm'
+                  : isDisabled
+                  ? 'text-gray-600 cursor-not-allowed opacity-40'
+                  : darkMode
+                  ? 'text-gray-400 hover:text-gray-200'
+                  : 'text-gray-600 hover:text-gray-900'
+              }`}
+            >
+              {tab.label}
+            </button>
+          );
+        })}
       </div>
 
       {/* Error */}
@@ -1058,6 +1164,14 @@ export default function DataCollectionHealth({ darkMode }) {
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.15 }}
           >
+            {activeTab === 'executive' && <ExecutiveOverview
+              workspaces={workspaces} execHealthData={execHealthData}
+              execScanning={execScanning} loadingWorkspaces={loadingWorkspaces}
+              onDrillDown={handleDrillDown} onLoadWorkspaces={loadWorkspaces}
+              onScanAll={scanAllWorkspaces}
+              darkMode={darkMode} cardClass={cardClass}
+              textPrimary={textPrimary} textSecondary={textSecondary} textMuted={textMuted}
+            />}
             {activeTab === 'overview' && <OverviewTab
               ingestionData={ingestionData} topTables={topTables} totalVolumeGB={totalVolumeGB}
               avgEps={avgEps} trendChartData={trendChartData} trendDataTypes={trendDataTypes}
@@ -1108,6 +1222,175 @@ export default function DataCollectionHealth({ darkMode }) {
           Last refreshed: {lastRefresh.toLocaleTimeString()} (cached for 10 minutes)
         </p>
       )}
+    </div>
+  );
+}
+
+// ── Executive Overview (All Clients) ─────────────────────────────────────────
+
+function ExecutiveOverview({ workspaces, execHealthData, execScanning, loadingWorkspaces, onDrillDown, onLoadWorkspaces, onScanAll, darkMode, cardClass, textPrimary, textSecondary, textMuted }) {
+  if (!workspaces.length) {
+    return (
+      <div className={`${cardClass} p-12 text-center`}>
+        {loadingWorkspaces ? (
+          <div className={`flex flex-col items-center gap-3 ${textSecondary}`}>
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500" />
+            <span>Discovering Sentinel workspaces...</span>
+          </div>
+        ) : (
+          <>
+            <p className={`font-medium text-lg mb-2 ${textPrimary}`}>Welcome to Health Monitor</p>
+            <p className={`text-sm mb-4 ${textSecondary}`}>Load your Sentinel workspaces to begin the health scan.</p>
+            <motion.button
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
+              onClick={onLoadWorkspaces}
+              className="px-6 py-2.5 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition-colors"
+            >
+              Load Workspaces
+            </motion.button>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  const scannedCount = Object.values(execHealthData).filter(v => v.data && !v.loading).length;
+  const noData = scannedCount === 0;
+
+  // Aggregate stats
+  const allHealthScores = workspaces.map(ws => {
+    const entry = execHealthData[ws.customerId];
+    return entry?.data ? computeOverallHealth(entry.data) : null;
+  }).filter(Boolean);
+
+  const healthyCt = allHealthScores.filter(h => h.status === 'Healthy').length;
+  const warningCt = allHealthScores.filter(h => h.status === 'Warning').length;
+  const criticalCt = allHealthScores.filter(h => h.status === 'Critical').length;
+  const totalVolume = workspaces.reduce((sum, ws) => {
+    const d = execHealthData[ws.customerId]?.data;
+    return sum + (parseFloat(d?.VolumeGB_24h) || 0);
+  }, 0);
+  const totalRuleFailures = workspaces.reduce((sum, ws) => {
+    const d = execHealthData[ws.customerId]?.data;
+    return sum + (parseInt(d?.RuleFailures) || 0);
+  }, 0);
+
+  // Sort: critical first, then warning, then healthy, then unscanned
+  const sortedWorkspaces = [...workspaces].sort((a, b) => {
+    const aEntry = execHealthData[a.customerId];
+    const bEntry = execHealthData[b.customerId];
+    const aHealth = aEntry?.data ? computeOverallHealth(aEntry.data) : null;
+    const bHealth = bEntry?.data ? computeOverallHealth(bEntry.data) : null;
+    if (!aHealth && !bHealth) return 0;
+    if (!aHealth) return 1;
+    if (!bHealth) return -1;
+    return aHealth.score - bHealth.score;
+  });
+
+  return (
+    <div className="space-y-6">
+      {/* Summary KPIs */}
+      {!noData && (
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
+          <KpiCard label="Clients Scanned" value={`${scannedCount}/${workspaces.length}`} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+          <KpiCard label="Healthy" value={healthyCt} color="#10b981" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+          <KpiCard label="Warning" value={warningCt} color={warningCt > 0 ? '#f59e0b' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+          <KpiCard label="Critical" value={criticalCt} color={criticalCt > 0 ? '#ef4444' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+          <KpiCard label="Total Ingestion (24h)" value={`${totalVolume.toFixed(2)} GB`} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+          <KpiCard label="Rule Failures (24h)" value={totalRuleFailures} color={totalRuleFailures > 0 ? '#f59e0b' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        </div>
+      )}
+
+      {noData && !execScanning && (
+        <div className={`${cardClass} p-8 text-center`}>
+          <p className={`font-medium mb-2 ${textPrimary}`}>{workspaces.length} workspaces discovered</p>
+          <p className={`text-sm ${textSecondary}`}>Click "Scan All Clients" to run a health check across all workspaces.</p>
+        </div>
+      )}
+
+      {/* Client health cards */}
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {sortedWorkspaces.map(ws => {
+          const entry = execHealthData[ws.customerId];
+          const data = entry?.data;
+          const isLoading = entry?.loading;
+          const wsError = entry?.error;
+          const health = data ? computeOverallHealth(data) : null;
+
+          return (
+            <motion.button
+              key={ws.customerId}
+              whileHover={{ scale: 1.01 }}
+              whileTap={{ scale: 0.99 }}
+              onClick={() => onDrillDown(ws)}
+              className={`text-left p-4 rounded-lg border transition-all ${
+                darkMode
+                  ? 'bg-gray-800 border-gray-700 hover:border-blue-500'
+                  : 'bg-white border-gray-200 hover:border-blue-400'
+              }`}
+            >
+              {/* Header row */}
+              <div className="flex items-center justify-between mb-3">
+                <div className={`font-medium truncate ${textPrimary}`}>{ws.name}</div>
+                {health && (
+                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-semibold"
+                    style={{ backgroundColor: `${health.color}20`, color: health.color }}>
+                    <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: health.color }} />
+                    {health.score}%
+                  </span>
+                )}
+                {isLoading && (
+                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-500" />
+                )}
+              </div>
+
+              {wsError && (
+                <p className="text-red-400 text-xs truncate">{wsError}</p>
+              )}
+
+              {data && (
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+                  <div className="flex justify-between">
+                    <span className={textMuted}>Ingestion</span>
+                    <span className={textSecondary}>{parseFloat(data.VolumeGB_24h || 0).toFixed(2)} GB</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className={textMuted}>Tables</span>
+                    <span className={textSecondary}>{data.TableCount || 0}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className={textMuted}>Rules</span>
+                    <span className={textSecondary}>{data.RulesTracked || 0} tracked</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className={textMuted}>Rule Failures</span>
+                    <span className={parseInt(data.RuleFailures) > 0 ? 'text-red-400 font-medium' : textSecondary}>
+                      {data.RuleFailures || 0}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className={textMuted}>Connectors</span>
+                    <span className={textSecondary}>{data.ConnTotal || 0}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className={textMuted}>Stale Tables</span>
+                    <span className={parseInt(data.StaleTables) > 0 ? 'text-yellow-400 font-medium' : textSecondary}>
+                      {data.StaleTables || 0}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {!data && !isLoading && !wsError && (
+                <p className={`text-xs ${textMuted}`}>Not yet scanned</p>
+              )}
+
+              <div className={`text-[10px] mt-2 ${textMuted}`}>Click to drill down</div>
+            </motion.button>
+          );
+        })}
+      </div>
     </div>
   );
 }
