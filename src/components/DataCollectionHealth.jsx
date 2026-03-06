@@ -139,7 +139,7 @@ function buildAnalyticsRuleHealthQuery(timeRange) {
   return `
 SentinelHealth
 | where TimeGenerated > ago(${timeRange})
-| where SentinelResourceType == "Analytic rule"
+| where SentinelResourceType == "Analytics Rule"
 | summarize arg_max(TimeGenerated, Status, Description, ExtendedProperties),
             FailureCount = countif(Status == "Failure"),
             SuccessCount = countif(Status == "Success"),
@@ -158,7 +158,7 @@ function buildRuleFailureTimelineQuery(timeRange) {
   return `
 SentinelHealth
 | where TimeGenerated > ago(${timeRange})
-| where SentinelResourceType == "Analytic rule"
+| where SentinelResourceType == "Analytics Rule"
 | where Status == "Failure"
 | summarize Failures = count() by bin(TimeGenerated, 1h)
 | order by TimeGenerated asc
