@@ -15,6 +15,7 @@ const AlertTriageAssistant = lazy(() => import('./components/AlertTriageAssistan
 const TriageChat = lazy(() => import('./components/TriageChat'));
 const Resources = lazy(() => import('./components/Resources'));
 const DeterminationGenerator = lazy(() => import('./components/DeterminationGenerator'));
+const MonthlyReportDashboard = lazy(() => import('./components/MonthlyReportDashboard'));
 
 // Loading component
 function LoadingFallback({ darkMode }) {
@@ -55,6 +56,7 @@ export default function ThreatDefenderDashboard() {
     { id: 'email-posture', name: 'Email Posture Check', icon: '📧', component: EmailPostureCheck },
     { id: 'email-headers', name: 'Email Header Analyzer', icon: '🔬', component: EmailHeaderAnalyzer },
     { id: 'determination-generator', name: 'Determination Generator', icon: '📝', component: DeterminationGenerator },
+    { id: 'monthly-report', name: 'Monthly Report', icon: '📊', component: MonthlyReportDashboard },
     { id: 'resources', name: 'Resources', icon: '🔗', component: Resources },
   ];
 
@@ -145,6 +147,14 @@ export default function ThreatDefenderDashboard() {
                 element={
                   <PageWrapper darkMode={darkMode}>
                     <DeterminationGenerator darkMode={darkMode} />
+                  </PageWrapper>
+                }
+              />
+              <Route
+                path="/monthly-report"
+                element={
+                  <PageWrapper darkMode={darkMode}>
+                    <MonthlyReportDashboard darkMode={darkMode} />
                   </PageWrapper>
                 }
               />

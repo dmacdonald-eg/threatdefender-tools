@@ -18,7 +18,8 @@ export default function Navigation({ tabs, darkMode, onDarkModeToggle }) {
     { id: 'prompt-gallery', name: 'Prompts' },
     { id: 'email-headers', name: 'Header Analyzer' },
     { id: 'determination-generator', name: 'Determinations' },
-    { id: 'soc-handoff', name: 'Shift Handoff' }
+    { id: 'soc-handoff', name: 'Shift Handoff' },
+    { id: 'monthly-report', name: 'Monthly Report' }
   ];
 
   const engineering = {
