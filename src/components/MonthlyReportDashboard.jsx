@@ -621,12 +621,24 @@ export default function MonthlyReportDashboard({ darkMode }) {
                 <h3 className={cardHeader}>Export Report</h3>
                 <p className={`text-sm ${subtle}`}>Download a formatted report for client delivery</p>
               </div>
-              <button
-                onClick={() => exportReport(metrics, incidents, selectedWorkspace, monthOptions[selectedMonth])}
-                className="px-5 py-2.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors"
-              >
-                Download HTML Report
-              </button>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => exportReport(metrics, incidents, selectedWorkspace, monthOptions[selectedMonth], 'html')}
+                  className={`px-5 py-2.5 text-sm font-medium rounded-lg transition-colors border ${
+                    darkMode
+                      ? 'border-gray-600 text-gray-300 hover:bg-gray-700'
+                      : 'border-gray-300 text-gray-700 hover:bg-gray-50'
+                  }`}
+                >
+                  Download HTML
+                </button>
+                <button
+                  onClick={() => exportReport(metrics, incidents, selectedWorkspace, monthOptions[selectedMonth], 'pdf')}
+                  className="px-5 py-2.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors"
+                >
+                  Save as PDF
+                </button>
+              </div>
             </div>
           </div>
         </motion.div>
@@ -703,7 +715,7 @@ function NotableIncidentCard({ incident, darkMode }) {
 
 // ── Export ────────────────────────────────────────────────────────────────────
 
-function exportReport(metrics, incidents, workspace, month) {
+function exportReport(metrics, incidents, workspace, month, mode = 'html') {
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -798,13 +810,21 @@ ${metrics.notable.map(inc => `<div class="notable">
 </body>
 </html>`;
 
-  const blob = new Blob([html], { type: 'text/html' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `Monthly_Report_${workspace.name.replace(/\s+/g, '_')}_${month.label.replace(/\s+/g, '_')}.html`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  if (mode === 'pdf') {
+    // Open in a new window and trigger print dialog (Save as PDF)
+    const printWindow = window.open('', '_blank');
+    printWindow.document.write(html);
+    printWindow.document.close();
+    printWindow.onload = () => { printWindow.print(); };
+  } else {
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Monthly_Report_${workspace.name.replace(/\s+/g, '_')}_${month.label.replace(/\s+/g, '_')}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
 }
