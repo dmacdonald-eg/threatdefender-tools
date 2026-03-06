@@ -702,7 +702,7 @@ export default function DataCollectionHealth({ darkMode }) {
           const merged = Array.from(tableSet).map(dt => {
             const vol = volumeRows.find(v => v.DataType === dt) || {};
             const lastLog = findMap[dt] || vol.LastUsageBatch || null;
-            const mins = lastLog ? Math.round((Date.now() - new Date(lastLog).getTime()) / 60000) : 99999;
+            const mins = lastLog ? Math.max(0, Math.round((Date.now() - new Date(lastLog).getTime()) / 60000)) : 99999;
             const status = mins <= 60 ? 'Fresh' : mins <= 1440 ? 'Aging' : mins <= 4320 ? 'Stale' : 'Critical';
             return {
               DataType: dt,
@@ -1719,7 +1719,7 @@ function FreshnessTab({ freshnessData, darkMode, cardClass, textPrimary, textSec
                 {freshnessData.map((row, i) => {
                   const statusColor = FRESHNESS_COLORS[row.FreshnessStatus] || '#6b7280';
                   const mins = parseInt(row.MinutesSinceLastLog) || 0;
-                  const timeSince = mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins/60)}h ${mins%60}m` : `${Math.floor(mins/1440)}d ${Math.floor((mins%1440)/60)}h`;
+                  const timeSince = mins === 0 ? '<1m' : mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins/60)}h ${mins%60}m` : `${Math.floor(mins/1440)}d ${Math.floor((mins%1440)/60)}h`;
                   const tableType = getTableType(row.DataType);
                   const typeColors = { Stream: '#3b82f6', Batch: '#8b5cf6', Event: '#f59e0b' };
                   return (
