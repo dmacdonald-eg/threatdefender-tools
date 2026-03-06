@@ -165,6 +165,21 @@ SentinelHealth
   `.trim();
 }
 
+function buildRuleFailureDetailsQuery(timeRange) {
+  return `
+SentinelHealth
+| where TimeGenerated > ago(${timeRange})
+| where SentinelResourceType == "Analytics Rule"
+| where Status == "Failure"
+| extend Issues = parse_json(ExtendedProperties).Issues
+| extend IssueCode = tostring(Issues[0].Code),
+         IssueDetail = tostring(Issues[0].Description)
+| project TimeGenerated, RuleName = SentinelResourceName,
+          Description, Reason, IssueCode, IssueDetail
+| order by TimeGenerated desc
+  `.trim();
+}
+
 // ── Data Freshness Queries ───────────────────────────────────────────────────
 
 function buildDataFreshnessQuery() {
@@ -409,6 +424,7 @@ export default function DataCollectionHealth({ darkMode }) {
   const [agentData, setAgentData] = useState(null);
   const [ruleHealthData, setRuleHealthData] = useState(null);
   const [ruleFailureTrend, setRuleFailureTrend] = useState(null);
+  const [ruleFailureDetails, setRuleFailureDetails] = useState(null);
   const [freshnessData, setFreshnessData] = useState(null);
   const [latencyData, setLatencyData] = useState(null);
   const [latencyTrend, setLatencyTrend] = useState(null);
@@ -668,12 +684,14 @@ export default function DataCollectionHealth({ darkMode }) {
           setError('Heartbeat table is not available. This workspace may not have agents (MMA/AMA) reporting to it.');
         }
       } else if (tab === 'rules') {
-        const [rules, trend] = await Promise.all([
+        const [rules, trend, details] = await Promise.all([
           runQuery(buildAnalyticsRuleHealthQuery(timeRange), `dch_rules_${wsKey}_${timeRange}`, { throwOnError: false }),
           runQuery(buildRuleFailureTimelineQuery(timeRange), `dch_rulefailures_${wsKey}_${timeRange}`, { throwOnError: false }),
+          runQuery(buildRuleFailureDetailsQuery(timeRange), `dch_ruledetails_${wsKey}_${timeRange}`, { throwOnError: false }),
         ]);
         setRuleHealthData(rules?.error ? [] : rules);
         setRuleFailureTrend(trend?.error ? [] : trend);
+        setRuleFailureDetails(details?.error ? [] : details);
         if (rules?.error) {
           setError('SentinelHealth table is not available. Enable Health Monitoring in Sentinel Settings to track analytics rule health.');
         }
@@ -776,6 +794,7 @@ export default function DataCollectionHealth({ darkMode }) {
     setAgentData(null);
     setRuleHealthData(null);
     setRuleFailureTrend(null);
+    setRuleFailureDetails(null);
     setFreshnessData(null);
     setLatencyData(null);
     setLatencyTrend(null);
@@ -1061,6 +1080,7 @@ export default function DataCollectionHealth({ darkMode }) {
             />}
             {activeTab === 'rules' && <RuleHealthTab
               ruleHealthData={ruleHealthData} ruleFailureTrend={ruleFailureTrend}
+              ruleFailureDetails={ruleFailureDetails}
               darkMode={darkMode} cardClass={cardClass}
               textPrimary={textPrimary} textSecondary={textSecondary} textMuted={textMuted}
             />}
@@ -1536,7 +1556,9 @@ function KpiCard({ label, value, subtitle, color, darkMode, cardClass, textPrima
 
 // ── Rule Health Tab ──────────────────────────────────────────────────────────
 
-function RuleHealthTab({ ruleHealthData, ruleFailureTrend, darkMode, cardClass, textPrimary, textSecondary, textMuted }) {
+function RuleHealthTab({ ruleHealthData, ruleFailureTrend, ruleFailureDetails, darkMode, cardClass, textPrimary, textSecondary, textMuted }) {
+  const [expandedRule, setExpandedRule] = useState(null);
+
   if (!ruleHealthData) {
     return <EmptyState message="Click 'Load Data' to view analytics rule health." darkMode={darkMode} />;
   }
@@ -1552,6 +1574,13 @@ function RuleHealthTab({ ruleHealthData, ruleFailureTrend, darkMode, cardClass, 
     time: new Date(r.TimeGenerated).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit' }),
     failures: parseInt(r.Failures) || 0,
   }));
+
+  // Group failure details by rule name for expandable rows
+  const failuresByRule = {};
+  (ruleFailureDetails || []).forEach(d => {
+    if (!failuresByRule[d.RuleName]) failuresByRule[d.RuleName] = [];
+    failuresByRule[d.RuleName].push(d);
+  });
 
   return (
     <div className="space-y-6">
@@ -1593,6 +1622,7 @@ function RuleHealthTab({ ruleHealthData, ruleFailureTrend, darkMode, cardClass, 
             <table className="w-full text-sm">
               <thead className="sticky top-0">
                 <tr className={`border-b ${darkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary} w-6`}></th>
                   <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Rule Name</th>
                   <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Status</th>
                   <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Health %</th>
@@ -1606,20 +1636,69 @@ function RuleHealthTab({ ruleHealthData, ruleFailureTrend, darkMode, cardClass, 
                   const healthPct = parseFloat(row.HealthPct) || 0;
                   const failures = parseInt(row.FailureCount) || 0;
                   const statusColor = healthPct >= 95 ? STATUS_COLORS.Healthy : healthPct >= 50 ? STATUS_COLORS.Warning : STATUS_COLORS.Critical;
+                  const isExpanded = expandedRule === row.RuleName;
+                  const ruleFailures = failuresByRule[row.RuleName] || [];
+                  const hasFailures = failures > 0 && ruleFailures.length > 0;
                   return (
-                    <tr key={i} className={`border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-100'}`}>
-                      <td className={`py-2 px-3 font-medium ${textPrimary}`}>{row.RuleName}</td>
-                      <td className="py-2 px-3">
-                        <span className="flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: statusColor }} />
-                          <span className={textSecondary}>{row.LastStatus || 'Unknown'}</span>
-                        </span>
-                      </td>
-                      <td className={`py-2 px-3 text-right font-medium`} style={{ color: statusColor }}>{healthPct}%</td>
-                      <td className={`py-2 px-3 text-right ${textSecondary}`}>{row.TotalRuns}</td>
-                      <td className={`py-2 px-3 text-right ${failures > 0 ? 'text-red-400 font-medium' : textMuted}`}>{failures}</td>
-                      <td className={`py-2 px-3 ${textMuted}`}>{timeAgo(row.LastRun)}</td>
-                    </tr>
+                    <React.Fragment key={i}>
+                      <tr
+                        className={`border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-100'} ${hasFailures ? 'cursor-pointer hover:bg-white/5' : ''}`}
+                        onClick={() => hasFailures && setExpandedRule(isExpanded ? null : row.RuleName)}
+                      >
+                        <td className={`py-2 px-3 ${textMuted}`}>
+                          {hasFailures && (
+                            <span className={`text-xs transition-transform inline-block ${isExpanded ? 'rotate-90' : ''}`}>&#9654;</span>
+                          )}
+                        </td>
+                        <td className={`py-2 px-3 font-medium ${textPrimary}`}>{row.RuleName}</td>
+                        <td className="py-2 px-3">
+                          <span className="flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: statusColor }} />
+                            <span className={textSecondary}>{row.LastStatus || 'Unknown'}</span>
+                          </span>
+                        </td>
+                        <td className={`py-2 px-3 text-right font-medium`} style={{ color: statusColor }}>{healthPct}%</td>
+                        <td className={`py-2 px-3 text-right ${textSecondary}`}>{row.TotalRuns}</td>
+                        <td className={`py-2 px-3 text-right ${failures > 0 ? 'text-red-400 font-medium' : textMuted}`}>{failures}</td>
+                        <td className={`py-2 px-3 ${textMuted}`}>{timeAgo(row.LastRun)}</td>
+                      </tr>
+                      {isExpanded && ruleFailures.length > 0 && (
+                        <tr>
+                          <td colSpan={7} className="p-0">
+                            <div className={`mx-3 my-2 rounded-lg ${darkMode ? 'bg-gray-800/80 border border-gray-700' : 'bg-gray-50 border border-gray-200'}`}>
+                              <div className="px-4 py-3">
+                                <h4 className={`text-xs font-semibold mb-3 ${textSecondary}`}>
+                                  Recent Failures ({Math.min(ruleFailures.length, 10)} of {ruleFailures.length})
+                                </h4>
+                                <div className="space-y-2">
+                                  {ruleFailures.slice(0, 10).map((f, j) => (
+                                    <div key={j} className={`text-xs p-2.5 rounded ${darkMode ? 'bg-gray-900/60' : 'bg-white'}`}>
+                                      <div className="flex items-center justify-between mb-1">
+                                        <span className={`font-medium ${textMuted}`}>
+                                          {new Date(f.TimeGenerated).toLocaleString()}
+                                        </span>
+                                        {f.IssueCode && (
+                                          <span className="px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 font-mono text-[10px]">
+                                            {f.IssueCode}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <p className={`${textSecondary} leading-relaxed`}>{f.Description}</p>
+                                      {f.IssueDetail && f.IssueDetail !== f.Description && (
+                                        <p className={`${textMuted} mt-1 leading-relaxed`}>{f.IssueDetail}</p>
+                                      )}
+                                      {f.Reason && f.Reason !== f.Description && (
+                                        <p className={`${textMuted} mt-1 italic leading-relaxed`}>{f.Reason}</p>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   );
                 })}
               </tbody>
@@ -1627,7 +1706,7 @@ function RuleHealthTab({ ruleHealthData, ruleFailureTrend, darkMode, cardClass, 
           </div>
           {failingRules.length > 0 && (
             <div className={`mt-4 p-3 rounded-lg ${darkMode ? 'bg-red-500/10 border border-red-500/20' : 'bg-red-50 border border-red-200'}`}>
-              <p className="text-red-400 text-xs font-medium">Failing rules may not be generating alerts. Review and fix these rules in Sentinel to avoid missed detections.</p>
+              <p className="text-red-400 text-xs font-medium">Failing rules may not be generating alerts. Review and fix these rules in Sentinel to avoid missed detections. Click a row to see failure details.</p>
             </div>
           )}
         </div>
