@@ -193,8 +193,9 @@ function buildIngestionLatencyQuery(timeRange) {
   return `
 union withsource=TableName *
 | where TimeGenerated > ago(${timeRange})
-| where isnotempty(_TimeReceived)
-| extend LatencySeconds = datetime_diff('second', _TimeReceived, TimeGenerated)
+| extend IngestTime = ingestion_time()
+| where isnotempty(IngestTime)
+| extend LatencySeconds = datetime_diff('second', IngestTime, TimeGenerated)
 | where LatencySeconds >= 0 and LatencySeconds < 86400
 | summarize AvgLatencySec = avg(LatencySeconds),
             P50Latency = percentile(LatencySeconds, 50),
@@ -212,8 +213,9 @@ function buildLatencyTrendQuery(timeRange) {
   return `
 union withsource=TableName *
 | where TimeGenerated > ago(${timeRange})
-| where isnotempty(_TimeReceived)
-| extend LatencySeconds = datetime_diff('second', _TimeReceived, TimeGenerated)
+| extend IngestTime = ingestion_time()
+| where isnotempty(IngestTime)
+| extend LatencySeconds = datetime_diff('second', IngestTime, TimeGenerated)
 | where LatencySeconds >= 0 and LatencySeconds < 86400
 | summarize AvgLatencySec = avg(LatencySeconds),
             P95Latency = percentile(LatencySeconds, 95)
@@ -549,6 +551,101 @@ export default function DataCollectionHealth({ darkMode }) {
                   dt?.state === 'Enabled' || dt?.state === 'enabled')
               : true,
           };
+        });
+
+        // Track which tables are already claimed by ARM connectors
+        const claimedTables = new Set();
+        merged.forEach(c => c.tables.forEach(t => claimedTables.add(t.table)));
+        // Also claim tables from the CONNECTOR_KIND_MAP even if no data
+        armConnectors.forEach(c => {
+          const tables = getConnectorTables(c);
+          tables.forEach(t => claimedTables.add(t));
+        });
+
+        // Create virtual connectors from Usage data for tables not covered by ARM
+        const TABLE_TO_SOURCE = {
+          'SecurityAlert': 'Security Alerts (Multiple Sources)',
+          'SecurityEvent': 'Windows Security Events',
+          'Syslog': 'Syslog',
+          'CommonSecurityLog': 'Common Event Format (CEF)',
+          'SigninLogs': 'Entra ID Sign-in Logs',
+          'AuditLogs': 'Entra ID Audit Logs',
+          'AADNonInteractiveUserSignInLogs': 'Entra ID Non-Interactive Sign-ins',
+          'AADServicePrincipalSignInLogs': 'Entra ID Service Principal Sign-ins',
+          'AADManagedIdentitySignInLogs': 'Entra ID Managed Identity Sign-ins',
+          'AADProvisioningLogs': 'Entra ID Provisioning',
+          'AzureActivity': 'Azure Activity',
+          'AzureDiagnostics': 'Azure Diagnostics',
+          'DeviceEvents': 'M365 Defender - Device Events',
+          'DeviceProcessEvents': 'M365 Defender - Process Events',
+          'DeviceNetworkEvents': 'M365 Defender - Network Events',
+          'DeviceFileEvents': 'M365 Defender - File Events',
+          'DeviceRegistryEvents': 'M365 Defender - Registry Events',
+          'DeviceLogonEvents': 'M365 Defender - Logon Events',
+          'DeviceImageLoadEvents': 'M365 Defender - Image Load Events',
+          'DeviceInfo': 'M365 Defender - Device Info',
+          'EmailEvents': 'M365 Defender - Email Events',
+          'EmailUrlInfo': 'M365 Defender - Email URL Info',
+          'EmailAttachmentInfo': 'M365 Defender - Email Attachments',
+          'EmailPostDeliveryEvents': 'M365 Defender - Post Delivery',
+          'AlertInfo': 'M365 Defender - Alert Info',
+          'AlertEvidence': 'M365 Defender - Alert Evidence',
+          'IdentityLogonEvents': 'M365 Defender - Identity Logon',
+          'IdentityQueryEvents': 'M365 Defender - Identity Query',
+          'IdentityDirectoryEvents': 'M365 Defender - Identity Directory',
+          'CloudAppEvents': 'M365 Defender - Cloud App Events',
+          'UrlClickEvents': 'M365 Defender - URL Click Events',
+          'ThreatIntelligenceIndicator': 'Threat Intelligence Indicators',
+          'Heartbeat': 'Agent Heartbeat',
+          'W3CIISLog': 'IIS Logs',
+          'DnsEvents': 'DNS Events',
+          'WindowsFirewall': 'Windows Firewall',
+          'OfficeActivity': 'Office 365 Activity',
+          'SecurityIncident': 'Sentinel Incidents',
+          'SentinelHealth': 'Sentinel Health',
+        };
+
+        // Group unclaimed tables by source name to avoid one row per M365D table
+        const sourceGroups = {};
+        lastLogRows.forEach(r => {
+          if (claimedTables.has(r.DataType)) return;
+          const sourceName = TABLE_TO_SOURCE[r.DataType] || r.DataType;
+          // Group M365 Defender tables together
+          const groupKey = sourceName.startsWith('M365 Defender') ? 'Microsoft 365 Defender (Advanced Hunting)' : sourceName;
+          if (!sourceGroups[groupKey]) {
+            sourceGroups[groupKey] = { tables: [], lastDataReceived: null };
+          }
+          const vol = parseFloat(r.VolumeGB) || 0;
+          const logTime = new Date(r.LastLog);
+          sourceGroups[groupKey].tables.push({ table: r.DataType, lastLog: r.LastLog, volumeGB: vol });
+          if (!sourceGroups[groupKey].lastDataReceived || logTime > sourceGroups[groupKey].lastDataReceived) {
+            sourceGroups[groupKey].lastDataReceived = logTime;
+          }
+        });
+
+        Object.entries(sourceGroups).forEach(([name, group]) => {
+          const minutesAgo = group.lastDataReceived ? (Date.now() - group.lastDataReceived.getTime()) / 60000 : Infinity;
+          const status = minutesAgo < 1440 ? 'Active' : 'Stale';
+
+          // Check if any health data matches
+          const healthMatch = Object.values(healthLookup).find(h =>
+            name.toLowerCase().includes(h.SentinelResourceName?.toLowerCase() || '___')
+            || h.SentinelResourceName?.toLowerCase().includes(name.toLowerCase().split(' ')[0] || '___')
+          );
+
+          merged.push({
+            name,
+            kind: 'Usage-detected',
+            status: healthMatch ? (healthMatch.LastStatus || status) : status,
+            healthPct: healthMatch ? parseFloat(healthMatch.HealthPct) || (status === 'Active' ? 100 : 50) : (status === 'Active' ? 100 : 50),
+            failureCount: healthMatch ? parseInt(healthMatch.FailureCount) || 0 : 0,
+            successCount: healthMatch ? parseInt(healthMatch.SuccessCount) || 0 : 0,
+            lastChecked: healthMatch?.LastChecked || null,
+            lastDataReceived: group.lastDataReceived?.toISOString() || null,
+            tables: group.tables,
+            hasHealthData: !!healthMatch,
+            enabled: true,
+          });
         });
 
         // Sort: failures first, then no-data, then active
