@@ -189,40 +189,38 @@ Usage
 
 // ── Ingestion Latency Queries ────────────────────────────────────────────────
 
-function buildIngestionLatencyQuery() {
-  // Sample last 1h with limit to avoid timeout on union *
+function buildIngestionLatencyQuery(timeRange) {
+  // Estimate ingestion latency from Usage table.
+  // TimeGenerated in Usage = when the usage batch was recorded (proxy for ingestion time)
+  // EndTime = latest event timestamp in that batch
+  // Difference approximates ingestion delay
   return `
-union withsource=TableName *
-| where TimeGenerated > ago(1h)
-| sample 100000
-| extend IngestTime = ingestion_time()
-| where isnotempty(IngestTime)
-| extend LatencySeconds = datetime_diff('second', IngestTime, TimeGenerated)
-| where LatencySeconds >= 0 and LatencySeconds < 86400
-| summarize AvgLatencySec = round(avg(LatencySeconds), 1),
-            P50Latency = round(percentile(LatencySeconds, 50), 1),
-            P95Latency = round(percentile(LatencySeconds, 95), 1),
-            P99Latency = round(percentile(LatencySeconds, 99), 1),
-            MaxLatency = max(LatencySeconds),
+Usage
+| where TimeGenerated > ago(${timeRange})
+| where IsBillable == true
+| extend EstimatedLatencyMin = datetime_diff('minute', TimeGenerated, EndTime)
+| where EstimatedLatencyMin >= 0 and EstimatedLatencyMin < 1440
+| summarize AvgLatencyMin = round(avg(EstimatedLatencyMin), 1),
+            P50Latency = round(percentile(EstimatedLatencyMin, 50), 1),
+            P95Latency = round(percentile(EstimatedLatencyMin, 95), 1),
+            P99Latency = round(percentile(EstimatedLatencyMin, 99), 1),
+            MaxLatency = max(EstimatedLatencyMin),
             SampleCount = count()
-  by TableName
-| where SampleCount > 5
-| order by AvgLatencySec desc
+  by DataType
+| where SampleCount > 3
+| order by AvgLatencyMin desc
   `.trim();
 }
 
-function buildLatencyTrendQuery() {
-  // 24h trend with sampling
+function buildLatencyTrendQuery(timeRange) {
   return `
-union withsource=TableName *
-| where TimeGenerated > ago(24h)
-| sample 200000
-| extend IngestTime = ingestion_time()
-| where isnotempty(IngestTime)
-| extend LatencySeconds = datetime_diff('second', IngestTime, TimeGenerated)
-| where LatencySeconds >= 0 and LatencySeconds < 86400
-| summarize AvgLatencySec = round(avg(LatencySeconds), 1),
-            P95Latency = round(percentile(LatencySeconds, 95), 1)
+Usage
+| where TimeGenerated > ago(${timeRange})
+| where IsBillable == true
+| extend EstimatedLatencyMin = datetime_diff('minute', TimeGenerated, EndTime)
+| where EstimatedLatencyMin >= 0 and EstimatedLatencyMin < 1440
+| summarize AvgLatencyMin = round(avg(EstimatedLatencyMin), 1),
+            P95Latency = round(percentile(EstimatedLatencyMin, 95), 1)
   by bin(TimeGenerated, 1h)
 | order by TimeGenerated asc
   `.trim();
@@ -686,13 +684,13 @@ export default function DataCollectionHealth({ darkMode }) {
         }
       } else if (tab === 'latency') {
         const [latency, trend] = await Promise.all([
-          runQuery(buildIngestionLatencyQuery(), `dch_latency_${wsKey}`, { throwOnError: false }),
-          runQuery(buildLatencyTrendQuery(), `dch_latencytrend_${wsKey}`, { throwOnError: false }),
+          runQuery(buildIngestionLatencyQuery(timeRange), `dch_latency_${wsKey}_${timeRange}`, { throwOnError: false }),
+          runQuery(buildLatencyTrendQuery(timeRange), `dch_latencytrend_${wsKey}_${timeRange}`, { throwOnError: false }),
         ]);
         setLatencyData(latency?.error ? [] : latency);
         setLatencyTrend(trend?.error ? [] : trend);
         if (latency?.error) {
-          setError('Latency query failed. The union * query may have timed out or ingestion_time() data is not available.');
+          setError('Latency query failed. The Usage table may not be accessible in this workspace.');
         }
       } else if (tab === 'throttling') {
         const [throttle, trend] = await Promise.all([
@@ -1693,33 +1691,33 @@ function LatencyTab({ latencyData, latencyTrend, darkMode, cardClass, textPrimar
     return <EmptyState message="Click 'Load Data' to measure ingestion latency." darkMode={darkMode} />;
   }
 
-  const highLatency = latencyData.filter(r => parseFloat(r.AvgLatencySec) > 300); // > 5 min avg
+  const highLatency = latencyData.filter(r => parseFloat(r.AvgLatencyMin) > 5); // > 5 min avg
   const overallAvg = latencyData.length > 0
-    ? (latencyData.reduce((sum, r) => sum + (parseFloat(r.AvgLatencySec) || 0), 0) / latencyData.length)
+    ? (latencyData.reduce((sum, r) => sum + (parseFloat(r.AvgLatencyMin) || 0), 0) / latencyData.length)
     : 0;
   const worstTable = latencyData[0];
 
   const trendChartData = (latencyTrend || []).map(r => ({
     time: new Date(r.TimeGenerated).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit' }),
-    avg: Math.round(parseFloat(r.AvgLatencySec) || 0),
+    avg: Math.round(parseFloat(r.AvgLatencyMin) || 0),
     p95: Math.round(parseFloat(r.P95Latency) || 0),
   }));
 
-  function formatLatency(seconds) {
-    if (seconds == null || isNaN(seconds)) return '—';
-    seconds = Math.round(seconds);
-    if (seconds < 60) return `${seconds}s`;
-    if (seconds < 3600) return `${Math.floor(seconds/60)}m ${seconds%60}s`;
-    return `${Math.floor(seconds/3600)}h ${Math.floor((seconds%3600)/60)}m`;
+  function formatLatency(minutes) {
+    if (minutes == null || isNaN(minutes)) return '—';
+    minutes = Math.round(minutes);
+    if (minutes < 1) return '<1m';
+    if (minutes < 60) return `${minutes}m`;
+    return `${Math.floor(minutes/60)}h ${minutes%60}m`;
   }
 
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <KpiCard label="Tables Measured" value={latencyData.length} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
-        <KpiCard label="Overall Avg Latency" value={formatLatency(overallAvg)} color={overallAvg > 300 ? '#f59e0b' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Overall Avg Latency" value={formatLatency(overallAvg)} color={overallAvg > 5 ? '#f59e0b' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
         <KpiCard label="High Latency Tables" value={highLatency.length} color={highLatency.length > 0 ? '#ef4444' : '#10b981'} subtitle=">5 min avg" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
-        <KpiCard label="Worst Table" value={worstTable?.TableName || '—'} subtitle={worstTable ? formatLatency(parseFloat(worstTable.AvgLatencySec)) : ''} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Worst Table" value={worstTable?.DataType || '—'} subtitle={worstTable ? formatLatency(parseFloat(worstTable.AvgLatencyMin)) : ''} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
       </div>
 
       {/* Latency trend chart */}
@@ -1730,9 +1728,9 @@ function LatencyTab({ latencyData, latencyTrend, darkMode, cardClass, textPrimar
             <LineChart data={trendChartData}>
               <CartesianGrid strokeDasharray="3 3" stroke={darkMode ? '#374151' : '#e5e7eb'} />
               <XAxis dataKey="time" tick={{ fontSize: 10, fill: darkMode ? '#9ca3af' : '#6b7280' }} interval="preserveStartEnd" />
-              <YAxis tick={{ fontSize: 11, fill: darkMode ? '#9ca3af' : '#6b7280' }} tickFormatter={v => `${v}s`} />
+              <YAxis tick={{ fontSize: 11, fill: darkMode ? '#9ca3af' : '#6b7280' }} tickFormatter={v => `${v}m`} />
               <Tooltip contentStyle={{ backgroundColor: darkMode ? '#1f2937' : '#fff', border: `1px solid ${darkMode ? '#374151' : '#e5e7eb'}`, borderRadius: '8px' }}
-                formatter={(val) => [`${val}s`, undefined]} />
+                formatter={(val) => [`${val}m`, undefined]} />
               <Legend wrapperStyle={{ fontSize: 11 }} />
               <Line type="monotone" dataKey="avg" stroke="#3b82f6" strokeWidth={2} dot={false} name="Average" />
               <Line type="monotone" dataKey="p95" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="P95" strokeDasharray="4 2" />
@@ -1744,7 +1742,7 @@ function LatencyTab({ latencyData, latencyTrend, darkMode, cardClass, textPrimar
       {latencyData.length === 0 ? (
         <div className={`${cardClass} p-8 text-center`}>
           <p className={`font-medium ${textPrimary}`}>No Latency Data</p>
-          <p className={`text-sm mt-1 ${textSecondary}`}>Ingestion latency data is not available for this workspace. This may occur if ingestion_time() is not supported or the query timed out.</p>
+          <p className={`text-sm mt-1 ${textSecondary}`}>No latency data found in the Usage table for this workspace and time range.</p>
         </div>
       ) : (
         <div className={`${cardClass} p-5`}>
@@ -1764,11 +1762,11 @@ function LatencyTab({ latencyData, latencyTrend, darkMode, cardClass, textPrimar
               </thead>
               <tbody>
                 {latencyData.map((row, i) => {
-                  const avg = parseFloat(row.AvgLatencySec) || 0;
-                  const color = avg > 600 ? '#ef4444' : avg > 300 ? '#f59e0b' : avg > 60 ? '#3b82f6' : '#10b981';
+                  const avg = parseFloat(row.AvgLatencyMin) || 0;
+                  const color = avg > 10 ? '#ef4444' : avg > 5 ? '#f59e0b' : avg > 1 ? '#3b82f6' : '#10b981';
                   return (
                     <tr key={i} className={`border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-100'}`}>
-                      <td className={`py-2 px-3 font-medium ${textPrimary}`}>{row.TableName}</td>
+                      <td className={`py-2 px-3 font-medium ${textPrimary}`}>{row.DataType}</td>
                       <td className={`py-2 px-3 text-right font-medium`} style={{ color }}>{formatLatency(avg)}</td>
                       <td className={`py-2 px-3 text-right ${textSecondary}`}>{formatLatency(parseFloat(row.P50Latency))}</td>
                       <td className={`py-2 px-3 text-right ${textSecondary}`}>{formatLatency(parseFloat(row.P95Latency))}</td>
