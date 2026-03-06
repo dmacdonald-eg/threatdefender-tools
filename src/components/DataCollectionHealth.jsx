@@ -71,16 +71,16 @@ function buildConnectorHealthQuery(timeRange) {
 SentinelHealth
 | where TimeGenerated > ago(${timeRange})
 | where SentinelResourceType == "Data connector"
-| summarize LastStatus = arg_max(TimeGenerated, Status, Description),
+| summarize arg_max(TimeGenerated, Status, Description),
             FailureCount = countif(Status == "Failure"),
             SuccessCount = countif(Status == "Success"),
             TotalEvents = count()
   by SentinelResourceName, SentinelResourceId
 | extend HealthPct = round(100.0 * SuccessCount / TotalEvents, 1)
-| project SentinelResourceName, LastStatus_Status = LastStatus_Status,
-          LastChecked = LastStatus_TimeGenerated,
+| project SentinelResourceName, LastStatus = Status,
+          LastChecked = TimeGenerated,
           HealthPct, FailureCount, SuccessCount,
-          LastDescription = LastStatus_Description
+          LastDescription = Description
 | order by FailureCount desc, SentinelResourceName asc
   `.trim();
 }
@@ -244,15 +244,23 @@ export default function DataCollectionHealth({ darkMode }) {
     }
   }, [getSentinelWorkspaces]);
 
-  // Run a cached KQL query
-  const runQuery = useCallback(async (query, cacheKey) => {
+  // Run a cached KQL query. If throwOnError is false, returns [] on failure.
+  const runQuery = useCallback(async (query, cacheKey, { throwOnError = true } = {}) => {
     const cached = getCached(cacheKey);
     if (cached) return cached;
 
-    const result = await fetchFromLogAnalytics(selectedWorkspace.customerId, query);
-    const rows = parseLogAnalyticsRows(result);
-    setCache(cacheKey, rows);
-    return rows;
+    try {
+      const result = await fetchFromLogAnalytics(selectedWorkspace.customerId, query);
+      const rows = parseLogAnalyticsRows(result);
+      setCache(cacheKey, rows);
+      return rows;
+    } catch (err) {
+      if (!throwOnError) {
+        // Table likely doesn't exist in this workspace
+        return { error: err.message };
+      }
+      throw err;
+    }
   }, [fetchFromLogAnalytics, selectedWorkspace]);
 
   // Fetch tab data
@@ -278,23 +286,24 @@ export default function DataCollectionHealth({ darkMode }) {
         setAnomalyData(anomalies);
       } else if (tab === 'connectors') {
         const [connectors, timeline] = await Promise.all([
-          runQuery(buildConnectorHealthQuery(timeRange), `dch_connectors_${wsKey}_${timeRange}`),
-          runQuery(buildConnectorTimelineQuery(timeRange), `dch_conntimeline_${wsKey}_${timeRange}`),
+          runQuery(buildConnectorHealthQuery(timeRange), `dch_connectors_${wsKey}_${timeRange}`, { throwOnError: false }),
+          runQuery(buildConnectorTimelineQuery(timeRange), `dch_conntimeline_${wsKey}_${timeRange}`, { throwOnError: false }),
         ]);
-        setConnectorData(connectors);
-        setConnectorTimeline(timeline);
+        setConnectorData(connectors?.error ? [] : connectors);
+        setConnectorTimeline(timeline?.error ? [] : timeline);
+        if (connectors?.error) {
+          setError('SentinelHealth table is not available. Enable diagnostic settings in Sentinel Settings > Health Monitoring to track connector health.');
+        }
       } else if (tab === 'agents') {
-        const agents = await runQuery(buildAgentHealthQuery(), `dch_agents_${wsKey}`);
-        setAgentData(agents);
+        const agents = await runQuery(buildAgentHealthQuery(), `dch_agents_${wsKey}`, { throwOnError: false });
+        setAgentData(agents?.error ? [] : agents);
+        if (agents?.error) {
+          setError('Heartbeat table is not available. This workspace may not have agents (MMA/AMA) reporting to it.');
+        }
       }
       setLastRefresh(new Date());
     } catch (err) {
-      // If the query fails due to table not existing, show a friendly message
-      if (err.message?.includes('could not be resolved') || err.message?.includes('not found')) {
-        setError(`Some tables are not available in this workspace. This is normal if certain features are not enabled.`);
-      } else {
-        setError(err.message);
-      }
+      setError(err.message);
     } finally {
       setLoading(false);
     }
@@ -839,8 +848,8 @@ function ConnectorsTab({ connectorData, connectorTimeline, darkMode, cardClass, 
     return <EmptyState message="Click 'Load Data' to view connector health. Note: SentinelHealth table must be enabled." darkMode={darkMode} />;
   }
 
-  const healthy = connectorData.filter(r => r.LastStatus_Status === 'Success' || parseFloat(r.HealthPct) >= 95);
-  const degraded = connectorData.filter(r => r.LastStatus_Status !== 'Success' && parseFloat(r.HealthPct) >= 50 && parseFloat(r.HealthPct) < 95);
+  const healthy = connectorData.filter(r => r.LastStatus === 'Success' || parseFloat(r.HealthPct) >= 95);
+  const degraded = connectorData.filter(r => r.LastStatus !== 'Success' && parseFloat(r.HealthPct) >= 50 && parseFloat(r.HealthPct) < 95);
   const unhealthy = connectorData.filter(r => parseFloat(r.HealthPct) < 50);
 
   return (
@@ -886,7 +895,7 @@ function ConnectorsTab({ connectorData, connectorTimeline, darkMode, cardClass, 
                       <td className="py-2 px-3">
                         <span className="flex items-center gap-2">
                           <span className="w-2 h-2 rounded-full" style={{ backgroundColor: statusColor }} />
-                          <span className={textSecondary}>{row.LastStatus_Status || 'Unknown'}</span>
+                          <span className={textSecondary}>{row.LastStatus || 'Unknown'}</span>
                         </span>
                       </td>
                       <td className={`py-2 px-3 text-right font-medium`} style={{ color: statusColor }}>{healthPct}%</td>
