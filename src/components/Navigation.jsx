@@ -26,7 +26,8 @@ export default function Navigation({ tabs, darkMode, onDarkModeToggle }) {
     name: 'Engineering',
     items: [
       { id: 'kql-diff', name: 'KQL Diff Viewer' },
-      { id: 'email-posture', name: 'Email Posture Check' }
+      { id: 'email-posture', name: 'Email Posture Check' },
+      { id: 'data-health', name: 'Data Collection Health' }
     ]
   };
 
