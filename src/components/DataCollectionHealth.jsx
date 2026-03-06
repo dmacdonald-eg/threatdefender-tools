@@ -389,9 +389,11 @@ let connHealth = SentinelHealth
 | where TimeGenerated > ago(24h)
 | where SentinelResourceType == "Data connector"
 | summarize ConnFailures = countif(Status == "Failure"), ConnTotal = dcount(SentinelResourceName);
+let batchOrEventTables = dynamic(["IntuneDevices","IntuneOperationalLogs","UserPeerAnalytics","BehaviorAnalytics","Anomalies","IdentityInfo","AADRiskyUsers","AADUserRiskEvents","Watchlist","SentinelAudit","SentinelHealth","ThreatIntelligenceIndicator","SecurityRecommendation","SecurityBaseline","SecurityBaselineSummary","Update","UpdateSummary","InsightsMetrics","ConfigurationData","SqlVulnerabilityAssessmentScanStatus","SqlVulnerabilityAssessmentResult","AddonAzureBackupJobs","AddonAzureBackupPolicy","AddonAzureBackupStorage","CoreAzureBackup","AzureBackupOperations","Usage","OfficeActivity","AuditLogs","MicrosoftGraphActivityLogs","AzureActivity","AzureDiagnostics","SecurityAlert","SecurityIncident","LAQueryLogs","EmailPostDeliveryEvents","EmailEvents","EmailUrlInfo","EmailAttachmentInfo","AlertEvidence","AlertInfo","CloudAppEvents"]);
 let staleTables = Usage
 | where TimeGenerated > ago(30d)
 | where IsBillable == true
+| where DataType !in (batchOrEventTables)
 | summarize LastSeen = max(TimeGenerated) by DataType
 | where datetime_diff('hour', now(), LastSeen) > 24
 | summarize StaleTables = count();
