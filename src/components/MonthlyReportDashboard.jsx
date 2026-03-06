@@ -15,10 +15,13 @@ SecurityIncident
 | summarize arg_max(TimeGenerated, *) by IncidentNumber
 | extend ClosedTimeActual = iff(Status == "Closed", ClosedTime, datetime(null))
 | extend ResolutionMinutes = iff(isnotempty(ClosedTimeActual), datetime_diff('minute', ClosedTimeActual, CreatedTime), int(null))
+| extend FirstModified = iff(FirstModifiedTime != CreatedTime, FirstModifiedTime, datetime(null))
+| extend TriageMinutes = iff(isnotempty(FirstModified), datetime_diff('minute', FirstModified, CreatedTime), int(null))
 | extend Tactics = tostring(AdditionalData.tactics)
 | extend Techniques = tostring(AdditionalData.techniques)
 | project IncidentNumber, Title, Severity, Status, Classification,
           CreatedTime, ClosedTime = ClosedTimeActual, ResolutionMinutes,
+          FirstModifiedTime = FirstModified, TriageMinutes,
           Owner, Labels, Tactics, Techniques, IncidentUrl
 | order by CreatedTime desc
   `.trim();
@@ -176,6 +179,8 @@ export default function MonthlyReportDashboard({ darkMode }) {
 
     // Resolution times for Medium+High only
     const analystResolutions = [];
+    // Triage times for Medium+High only
+    const analystTriageTimes = [];
     // All resolution times
     const allResolutions = [];
 
@@ -201,6 +206,10 @@ export default function MonthlyReportDashboard({ darkMode }) {
         if (isAnalyst) analystResolutions.push(inc.ResolutionMinutes);
       }
 
+      if (inc.TriageMinutes != null && inc.TriageMinutes > 0 && isAnalyst) {
+        analystTriageTimes.push(inc.TriageMinutes);
+      }
+
       parseTactics(inc.Tactics).forEach(t => {
         tacticsMap[t] = (tacticsMap[t] || 0) + 1;
       });
@@ -208,6 +217,10 @@ export default function MonthlyReportDashboard({ darkMode }) {
 
     const avgMTTR = analystResolutions.length > 0
       ? analystResolutions.reduce((a, b) => a + b, 0) / analystResolutions.length
+      : null;
+
+    const avgMTTT = analystTriageTimes.length > 0
+      ? analystTriageTimes.reduce((a, b) => a + b, 0) / analystTriageTimes.length
       : null;
 
     const overallMTTR = allResolutions.length > 0
@@ -258,7 +271,7 @@ export default function MonthlyReportDashboard({ darkMode }) {
 
     return {
       total, analystTouched, truePositives, fpRate,
-      avgMTTR, overallMTTR,
+      avgMTTR, avgMTTT, overallMTTR,
       severityTable, categoryTable, tacticsData, notable,
       bySeverity, byCategory,
     };
@@ -420,10 +433,11 @@ export default function MonthlyReportDashboard({ darkMode }) {
           className="space-y-6"
         >
           {/* KPI Cards */}
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
             <KPICard darkMode={darkMode} label="Total Incidents" sublabel="All severities" value={metrics.total} />
             <KPICard darkMode={darkMode} label="Analyst-Investigated" sublabel="Medium + High" value={metrics.analystTouched} />
-            <KPICard darkMode={darkMode} label="Human MTTR" sublabel="Medium + High only" value={formatMinutes(metrics.avgMTTR)} />
+            <KPICard darkMode={darkMode} label="Mean Time to Triage" sublabel="Medium + High only" value={formatMinutes(metrics.avgMTTT)} />
+            <KPICard darkMode={darkMode} label="Human MTTR" sublabel="Mean Time to Resolve" value={formatMinutes(metrics.avgMTTR)} />
             <KPICard darkMode={darkMode} label="True Positives" sublabel="Confirmed threats" value={metrics.truePositives} />
             <KPICard darkMode={darkMode} label="Benign/FP Rate" sublabel="Of classified incidents" value={metrics.fpRate != null ? `${metrics.fpRate}%` : '—'} />
           </div>
@@ -702,7 +716,7 @@ function exportReport(metrics, incidents, workspace, month) {
   .header { text-align: center; margin-bottom: 40px; }
   .header .brand { font-size: 14px; color: #6b7280; text-transform: uppercase; letter-spacing: 2px; }
   .header .subtitle { color: #6b7280; }
-  .kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin: 24px 0; }
+  .kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; margin: 24px 0; }
   .kpi { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; text-align: center; }
   .kpi .value { font-size: 28px; font-weight: 700; color: #1e40af; }
   .kpi .label { font-size: 13px; color: #374151; margin-top: 4px; }
@@ -720,7 +734,7 @@ function exportReport(metrics, incidents, workspace, month) {
   .notable .meta { font-size: 12px; color: #6b7280; }
   .footer { text-align: center; margin-top: 48px; padding-top: 24px; border-top: 1px solid #e5e7eb; color: #9ca3af; font-size: 13px; }
   .confidential { text-align: center; color: #ef4444; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; margin-top: 8px; }
-  @media print { body { padding: 20px; } .kpis { grid-template-columns: repeat(5, 1fr); } }
+  @media print { body { padding: 20px; } .kpis { grid-template-columns: repeat(6, 1fr); } }
 </style>
 </head>
 <body>
@@ -737,7 +751,8 @@ function exportReport(metrics, incidents, workspace, month) {
 <div class="kpis">
   <div class="kpi"><div class="value">${metrics.total}</div><div class="label">Total Incidents</div><div class="sublabel">All severities</div></div>
   <div class="kpi"><div class="value">${metrics.analystTouched}</div><div class="label">Analyst-Investigated</div><div class="sublabel">Medium + High</div></div>
-  <div class="kpi"><div class="value">${formatMinutes(metrics.avgMTTR)}</div><div class="label">Human MTTR</div><div class="sublabel">Medium + High only</div></div>
+  <div class="kpi"><div class="value">${formatMinutes(metrics.avgMTTT)}</div><div class="label">Mean Time to Triage</div><div class="sublabel">Medium + High only</div></div>
+  <div class="kpi"><div class="value">${formatMinutes(metrics.avgMTTR)}</div><div class="label">Human MTTR</div><div class="sublabel">Mean Time to Resolve</div></div>
   <div class="kpi"><div class="value">${metrics.truePositives}</div><div class="label">True Positives</div><div class="sublabel">Confirmed threats</div></div>
   <div class="kpi"><div class="value">${metrics.fpRate != null ? metrics.fpRate + '%' : '—'}</div><div class="label">Benign/FP Rate</div><div class="sublabel">Of classified</div></div>
 </div>
