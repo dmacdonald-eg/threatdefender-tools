@@ -168,22 +168,23 @@ SentinelHealth
 // ── Data Freshness Queries ───────────────────────────────────────────────────
 
 function buildDataFreshnessQuery() {
+  // Get actual last-event time per table using find (1d lookback to avoid timeout)
+  return `
+find withsource=DataType in (*) where TimeGenerated > ago(1d)
+| summarize LastLog = max(TimeGenerated) by DataType
+  `.trim();
+}
+
+function buildDataVolumeQuery() {
+  // Get volume stats and table list from Usage (30d lookback for full picture)
   return `
 Usage
 | where TimeGenerated > ago(30d)
 | where IsBillable == true
-| summarize LastLog = max(TimeGenerated),
+| summarize LastUsageBatch = max(TimeGenerated),
             AvgDailyGB = sum(Quantity) / 1024.0 / 30.0,
             DaysWithData = dcount(bin(TimeGenerated, 1d))
   by DataType
-| extend MinutesSinceLastLog = datetime_diff('minute', now(), LastLog)
-| extend FreshnessStatus = case(
-    MinutesSinceLastLog <= 60, 'Fresh',
-    MinutesSinceLastLog <= 1440, 'Aging',
-    MinutesSinceLastLog <= 4320, 'Stale',
-    'Critical'
-  )
-| order by MinutesSinceLastLog desc
   `.trim();
 }
 
@@ -677,10 +678,43 @@ export default function DataCollectionHealth({ darkMode }) {
           setError('SentinelHealth table is not available. Enable Health Monitoring in Sentinel Settings to track analytics rule health.');
         }
       } else if (tab === 'freshness') {
-        const freshness = await runQuery(buildDataFreshnessQuery(), `dch_freshness_${wsKey}`, { throwOnError: false });
-        setFreshnessData(freshness?.error ? [] : freshness);
-        if (freshness?.error) {
-          setError('Usage table query failed. This may be a permissions issue.');
+        const [freshness, volume] = await Promise.all([
+          runQuery(buildDataFreshnessQuery(), `dch_freshness_${wsKey}`, { throwOnError: false }),
+          runQuery(buildDataVolumeQuery(), `dch_volume_${wsKey}`, { throwOnError: false }),
+        ]);
+        // Build merged freshness from both sources
+        // find query gives real-time last event (1d window)
+        // Usage gives volume stats + fallback last-log for older tables
+        const findMap = {};
+        if (freshness && !freshness.error) {
+          freshness.forEach(f => { findMap[f.DataType] = f.LastLog; });
+        }
+        const volumeRows = (volume && !volume.error) ? volume : [];
+        if (volumeRows.length === 0 && (!freshness || freshness.error)) {
+          setFreshnessData([]);
+          setError('Data freshness queries failed. This may be a permissions issue.');
+        } else {
+          // Start with all tables from Usage, overlay with find results
+          const tableSet = new Set([
+            ...volumeRows.map(v => v.DataType),
+            ...Object.keys(findMap),
+          ]);
+          const merged = Array.from(tableSet).map(dt => {
+            const vol = volumeRows.find(v => v.DataType === dt) || {};
+            const lastLog = findMap[dt] || vol.LastUsageBatch || null;
+            const mins = lastLog ? Math.round((Date.now() - new Date(lastLog).getTime()) / 60000) : 99999;
+            const status = mins <= 60 ? 'Fresh' : mins <= 1440 ? 'Aging' : mins <= 4320 ? 'Stale' : 'Critical';
+            return {
+              DataType: dt,
+              LastLog: lastLog,
+              MinutesSinceLastLog: String(mins),
+              FreshnessStatus: status,
+              AvgDailyGB: vol.AvgDailyGB || '0',
+              DaysWithData: vol.DaysWithData || '0',
+            };
+          });
+          merged.sort((a, b) => parseInt(b.MinutesSinceLastLog) - parseInt(a.MinutesSinceLastLog));
+          setFreshnessData(merged);
         }
       } else if (tab === 'latency') {
         const [latency, trend] = await Promise.all([
