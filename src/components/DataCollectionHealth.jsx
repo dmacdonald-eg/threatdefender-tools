@@ -1638,6 +1638,40 @@ function RuleHealthTab({ ruleHealthData, ruleFailureTrend, darkMode, cardClass, 
 
 // ── Data Freshness Tab ───────────────────────────────────────────────────────
 
+// Tables that sync on a batch/periodic schedule (not real-time streaming)
+const BATCH_TABLES = new Set([
+  'IntuneDevices', 'IntuneOperationalLogs',
+  'UserPeerAnalytics', 'BehaviorAnalytics', 'Anomalies', 'IdentityInfo',
+  'AADRiskyUsers', 'AADUserRiskEvents',
+  'Watchlist', 'SentinelAudit', 'SentinelHealth',
+  'ThreatIntelligenceIndicator',
+  'SecurityRecommendation', 'SecurityBaseline', 'SecurityBaselineSummary',
+  'Update', 'UpdateSummary',
+  'InsightsMetrics', 'ConfigurationData',
+  'SqlVulnerabilityAssessmentScanStatus', 'SqlVulnerabilityAssessmentResult',
+  'AddonAzureBackupJobs', 'AddonAzureBackupPolicy', 'AddonAzureBackupStorage',
+  'CoreAzureBackup', 'AzureBackupOperations',
+  'Usage',
+]);
+
+// Tables that only log on-demand (event-driven, may be quiet for long periods)
+const EVENT_DRIVEN_TABLES = new Set([
+  'OfficeActivity', 'AuditLogs', 'MicrosoftGraphActivityLogs',
+  'AzureActivity', 'AzureDiagnostics',
+  'SecurityAlert', 'SecurityIncident',
+  'SentinelAudit',
+  'LAQueryLogs',
+  'EmailPostDeliveryEvents', 'EmailEvents', 'EmailUrlInfo', 'EmailAttachmentInfo',
+  'AlertEvidence', 'AlertInfo',
+  'CloudAppEvents',
+]);
+
+function getTableType(dataType) {
+  if (BATCH_TABLES.has(dataType)) return { label: 'Batch', tip: 'Syncs periodically (hours/daily). Aging status is expected.' };
+  if (EVENT_DRIVEN_TABLES.has(dataType)) return { label: 'Event', tip: 'Logs only when events occur. Gaps are normal during quiet periods.' };
+  return { label: 'Stream', tip: 'Real-time streaming table. Should stay Fresh.' };
+}
+
 function FreshnessTab({ freshnessData, darkMode, cardClass, textPrimary, textSecondary, textMuted }) {
   if (!freshnessData) {
     return <EmptyState message="Click 'Load Data' to check data freshness across all tables." darkMode={darkMode} />;
@@ -1673,6 +1707,7 @@ function FreshnessTab({ freshnessData, darkMode, cardClass, textPrimary, textSec
               <thead className="sticky top-0">
                 <tr className={`border-b ${darkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
                   <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Data Type</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Type</th>
                   <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Status</th>
                   <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Last Log</th>
                   <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Time Since</th>
@@ -1685,9 +1720,17 @@ function FreshnessTab({ freshnessData, darkMode, cardClass, textPrimary, textSec
                   const statusColor = FRESHNESS_COLORS[row.FreshnessStatus] || '#6b7280';
                   const mins = parseInt(row.MinutesSinceLastLog) || 0;
                   const timeSince = mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins/60)}h ${mins%60}m` : `${Math.floor(mins/1440)}d ${Math.floor((mins%1440)/60)}h`;
+                  const tableType = getTableType(row.DataType);
+                  const typeColors = { Stream: '#3b82f6', Batch: '#8b5cf6', Event: '#f59e0b' };
                   return (
                     <tr key={i} className={`border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-100'}`}>
                       <td className={`py-2 px-3 font-medium ${textPrimary}`}>{row.DataType}</td>
+                      <td className="py-2 px-3" title={tableType.tip}>
+                        <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium"
+                          style={{ backgroundColor: `${typeColors[tableType.label]}15`, color: typeColors[tableType.label] }}>
+                          {tableType.label}
+                        </span>
+                      </td>
                       <td className="py-2 px-3">
                         <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium`}
                           style={{ backgroundColor: `${statusColor}20`, color: statusColor }}>
@@ -1705,13 +1748,28 @@ function FreshnessTab({ freshnessData, darkMode, cardClass, textPrimary, textSec
               </tbody>
             </table>
           </div>
-          {(stale.length > 0 || critical.length > 0) && (
-            <div className={`mt-4 p-3 rounded-lg ${darkMode ? 'bg-yellow-500/10 border border-yellow-500/20' : 'bg-yellow-50 border border-yellow-200'}`}>
-              <p className="text-yellow-400 text-xs font-medium">
-                {stale.length + critical.length} table(s) have not received data recently. This may indicate a silent connector failure — data is not flowing but no error is reported.
-              </p>
-            </div>
-          )}
+          {(() => {
+            const staleStreaming = [...stale, ...critical].filter(r => getTableType(r.DataType).label === 'Stream');
+            const staleBatch = [...stale, ...critical].filter(r => getTableType(r.DataType).label !== 'Stream');
+            return (
+              <>
+                {staleStreaming.length > 0 && (
+                  <div className={`mt-4 p-3 rounded-lg ${darkMode ? 'bg-red-500/10 border border-red-500/20' : 'bg-red-50 border border-red-200'}`}>
+                    <p className="text-red-400 text-xs font-medium">
+                      {staleStreaming.length} streaming table(s) have not received data recently: {staleStreaming.map(r => r.DataType).join(', ')}. This may indicate a silent connector failure.
+                    </p>
+                  </div>
+                )}
+                {staleBatch.length > 0 && (
+                  <div className={`mt-4 p-3 rounded-lg ${darkMode ? 'bg-gray-500/10 border border-gray-500/20' : 'bg-gray-50 border border-gray-200'}`}>
+                    <p className={`text-xs font-medium ${textMuted}`}>
+                      {staleBatch.length} batch/event-driven table(s) are stale — this is often expected for periodic or on-demand sources.
+                    </p>
+                  </div>
+                )}
+              </>
+            );
+          })()}
         </div>
       )}
     </div>
