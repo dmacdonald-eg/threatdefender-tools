@@ -189,36 +189,40 @@ Usage
 
 // ── Ingestion Latency Queries ────────────────────────────────────────────────
 
-function buildIngestionLatencyQuery(timeRange) {
+function buildIngestionLatencyQuery() {
+  // Sample last 1h with limit to avoid timeout on union *
   return `
 union withsource=TableName *
-| where TimeGenerated > ago(${timeRange})
+| where TimeGenerated > ago(1h)
+| sample 100000
 | extend IngestTime = ingestion_time()
 | where isnotempty(IngestTime)
 | extend LatencySeconds = datetime_diff('second', IngestTime, TimeGenerated)
 | where LatencySeconds >= 0 and LatencySeconds < 86400
-| summarize AvgLatencySec = avg(LatencySeconds),
-            P50Latency = percentile(LatencySeconds, 50),
-            P95Latency = percentile(LatencySeconds, 95),
-            P99Latency = percentile(LatencySeconds, 99),
+| summarize AvgLatencySec = round(avg(LatencySeconds), 1),
+            P50Latency = round(percentile(LatencySeconds, 50), 1),
+            P95Latency = round(percentile(LatencySeconds, 95), 1),
+            P99Latency = round(percentile(LatencySeconds, 99), 1),
             MaxLatency = max(LatencySeconds),
             SampleCount = count()
   by TableName
-| where SampleCount > 10
+| where SampleCount > 5
 | order by AvgLatencySec desc
   `.trim();
 }
 
-function buildLatencyTrendQuery(timeRange) {
+function buildLatencyTrendQuery() {
+  // 24h trend with sampling
   return `
 union withsource=TableName *
-| where TimeGenerated > ago(${timeRange})
+| where TimeGenerated > ago(24h)
+| sample 200000
 | extend IngestTime = ingestion_time()
 | where isnotempty(IngestTime)
 | extend LatencySeconds = datetime_diff('second', IngestTime, TimeGenerated)
 | where LatencySeconds >= 0 and LatencySeconds < 86400
-| summarize AvgLatencySec = avg(LatencySeconds),
-            P95Latency = percentile(LatencySeconds, 95)
+| summarize AvgLatencySec = round(avg(LatencySeconds), 1),
+            P95Latency = round(percentile(LatencySeconds, 95), 1)
   by bin(TimeGenerated, 1h)
 | order by TimeGenerated asc
   `.trim();
@@ -682,13 +686,13 @@ export default function DataCollectionHealth({ darkMode }) {
         }
       } else if (tab === 'latency') {
         const [latency, trend] = await Promise.all([
-          runQuery(buildIngestionLatencyQuery(timeRange), `dch_latency_${wsKey}_${timeRange}`, { throwOnError: false }),
-          runQuery(buildLatencyTrendQuery(timeRange), `dch_latencytrend_${wsKey}_${timeRange}`, { throwOnError: false }),
+          runQuery(buildIngestionLatencyQuery(), `dch_latency_${wsKey}`, { throwOnError: false }),
+          runQuery(buildLatencyTrendQuery(), `dch_latencytrend_${wsKey}`, { throwOnError: false }),
         ]);
         setLatencyData(latency?.error ? [] : latency);
         setLatencyTrend(trend?.error ? [] : trend);
         if (latency?.error) {
-          setError('Latency data not available. The _TimeReceived field may not be present in all tables.');
+          setError('Latency query failed. The union * query may have timed out or ingestion_time() data is not available.');
         }
       } else if (tab === 'throttling') {
         const [throttle, trend] = await Promise.all([
@@ -1740,7 +1744,7 @@ function LatencyTab({ latencyData, latencyTrend, darkMode, cardClass, textPrimar
       {latencyData.length === 0 ? (
         <div className={`${cardClass} p-8 text-center`}>
           <p className={`font-medium ${textPrimary}`}>No Latency Data</p>
-          <p className={`text-sm mt-1 ${textSecondary}`}>The _TimeReceived field is not available or no data matched in this time range.</p>
+          <p className={`text-sm mt-1 ${textSecondary}`}>Ingestion latency data is not available for this workspace. This may occur if ingestion_time() is not supported or the query timed out.</p>
         </div>
       ) : (
         <div className={`${cardClass} p-5`}>
