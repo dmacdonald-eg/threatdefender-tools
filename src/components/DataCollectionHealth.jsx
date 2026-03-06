@@ -124,6 +124,61 @@ Heartbeat
   `.trim();
 }
 
+function buildLastLogPerTableQuery(timeRange) {
+  return `
+Usage
+| where TimeGenerated > ago(${timeRange})
+| summarize LastLog = max(TimeGenerated), VolumeGB = sum(Quantity) / 1024.0 by DataType
+| order by DataType asc
+  `.trim();
+}
+
+// Map ARM connector kind to a friendly display name and associated tables
+const CONNECTOR_KIND_MAP = {
+  'Office365': { name: 'Office 365', tables: ['OfficeActivity'] },
+  'MicrosoftCloudAppSecurity': { name: 'Microsoft Defender for Cloud Apps', tables: ['McasShadowItReporting'] },
+  'AzureActiveDirectory': { name: 'Azure Active Directory', tables: ['SigninLogs', 'AuditLogs'] },
+  'AzureSecurityCenter': { name: 'Microsoft Defender for Cloud', tables: ['SecurityAlert'] },
+  'MicrosoftDefenderAdvancedThreatProtection': { name: 'Microsoft Defender for Endpoint', tables: ['SecurityAlert'] },
+  'ThreatIntelligence': { name: 'Threat Intelligence', tables: ['ThreatIntelligenceIndicator'] },
+  'ThreatIntelligenceTaxii': { name: 'Threat Intelligence (TAXII)', tables: ['ThreatIntelligenceIndicator'] },
+  'AzureAdvancedThreatProtection': { name: 'Microsoft Defender for Identity', tables: ['SecurityAlert'] },
+  'MicrosoftThreatProtection': { name: 'Microsoft 365 Defender', tables: ['AlertInfo', 'AlertEvidence', 'DeviceEvents'] },
+  'OfficeATP': { name: 'Microsoft Defender for Office 365', tables: ['EmailEvents', 'EmailUrlInfo'] },
+  'OfficeIRM': { name: 'Office 365 IRM', tables: ['OfficeActivity'] },
+  'AmazonWebServicesCloudTrail': { name: 'AWS CloudTrail', tables: ['AWSCloudTrail'] },
+  'AmazonWebServicesS3': { name: 'AWS S3', tables: ['AWSCloudTrail'] },
+  'Syslog': { name: 'Syslog', tables: ['Syslog'] },
+  'SecurityEvents': { name: 'Windows Security Events', tables: ['SecurityEvent'] },
+  'WindowsFirewall': { name: 'Windows Firewall', tables: ['WindowsFirewall'] },
+  'CEF': { name: 'Common Event Format (CEF)', tables: ['CommonSecurityLog'] },
+  'MicrosoftThreatIntelligence': { name: 'Microsoft Threat Intelligence', tables: ['ThreatIntelligenceIndicator'] },
+  'AzureActivity': { name: 'Azure Activity', tables: ['AzureActivity'] },
+  'AADUserRiskEvents': { name: 'Entra ID Risk Events', tables: ['AADUserRiskEvents'] },
+  'IOT': { name: 'IoT Defender', tables: ['SecurityAlert'] },
+  'GenericUI': { name: 'Custom Connector', tables: [] },
+  'APIPolling': { name: 'API Polling Connector', tables: [] },
+};
+
+function getConnectorDisplayName(connector) {
+  const kind = connector.kind || '';
+  const mapped = CONNECTOR_KIND_MAP[kind];
+  if (mapped) return mapped.name;
+  // Fall back to name from properties or kind
+  return connector.properties?.connectorUiConfig?.title
+    || connector.properties?.displayName
+    || kind
+    || connector.name
+    || 'Unknown Connector';
+}
+
+function getConnectorTables(connector) {
+  const kind = connector.kind || '';
+  const mapped = CONNECTOR_KIND_MAP[kind];
+  if (mapped) return mapped.tables;
+  return [];
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function parseLogAnalyticsRows(response) {
@@ -208,7 +263,7 @@ const CHART_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#e
 // ── Main Component ───────────────────────────────────────────────────────────
 
 export default function DataCollectionHealth({ darkMode }) {
-  const { isAuthenticated, isMsalAvailable, login, getSentinelWorkspaces, fetchFromLogAnalytics } = useAuth();
+  const { isAuthenticated, isMsalAvailable, login, getSentinelWorkspaces, fetchFromLogAnalytics, fetchFromArm } = useAuth();
 
   const [workspaces, setWorkspaces] = useState([]);
   const [selectedWorkspace, setSelectedWorkspace] = useState(null);
@@ -285,15 +340,98 @@ export default function DataCollectionHealth({ darkMode }) {
         const anomalies = await runQuery(buildAnomalyQuery(timeRange), `dch_anomaly_${wsKey}_${timeRange}`);
         setAnomalyData(anomalies);
       } else if (tab === 'connectors') {
-        const [connectors, timeline] = await Promise.all([
+        // Hybrid approach: ARM API for all connectors + SentinelHealth + Usage for activity
+        const wsResourceId = selectedWorkspace.id;
+        const [armConnectorsRaw, healthData, lastLogData] = await Promise.all([
+          fetchFromArm(
+            `https://management.azure.com${wsResourceId}/providers/Microsoft.SecurityInsights/dataConnectors?api-version=2023-11-01`
+          ).catch(() => ({ value: [] })),
           runQuery(buildConnectorHealthQuery(timeRange), `dch_connectors_${wsKey}_${timeRange}`, { throwOnError: false }),
-          runQuery(buildConnectorTimelineQuery(timeRange), `dch_conntimeline_${wsKey}_${timeRange}`, { throwOnError: false }),
+          runQuery(buildLastLogPerTableQuery(timeRange), `dch_lastlog_${wsKey}_${timeRange}`, { throwOnError: false }),
         ]);
-        setConnectorData(connectors?.error ? [] : connectors);
-        setConnectorTimeline(timeline?.error ? [] : timeline);
-        if (connectors?.error) {
-          setError('SentinelHealth table is not available. Enable diagnostic settings in Sentinel Settings > Health Monitoring to track connector health.');
-        }
+
+        const armConnectors = armConnectorsRaw.value || [];
+        const healthRows = healthData?.error ? [] : (healthData || []);
+        const lastLogRows = lastLogData?.error ? [] : (lastLogData || []);
+
+        // Build lookup: SentinelResourceName -> health row
+        const healthLookup = {};
+        healthRows.forEach(h => { healthLookup[h.SentinelResourceName] = h; });
+
+        // Build lookup: DataType -> last log info
+        const tableLookup = {};
+        lastLogRows.forEach(r => { tableLookup[r.DataType] = r; });
+
+        // Merge: start with ARM connectors, enrich with health + usage data
+        const merged = armConnectors.map(c => {
+          const displayName = getConnectorDisplayName(c);
+          const tables = getConnectorTables(c);
+          const kind = c.kind || '';
+
+          // Try to match SentinelHealth by connector name patterns
+          const healthMatch = healthLookup[displayName]
+            || healthLookup[kind]
+            || Object.values(healthLookup).find(h =>
+              h.SentinelResourceName?.toLowerCase().includes(kind.toLowerCase())
+            );
+
+          // Check if any associated tables have recent data
+          let lastDataReceived = null;
+          let tableActivity = [];
+          tables.forEach(t => {
+            const tInfo = tableLookup[t];
+            if (tInfo) {
+              tableActivity.push({ table: t, lastLog: tInfo.LastLog, volumeGB: parseFloat(tInfo.VolumeGB) || 0 });
+              const logTime = new Date(tInfo.LastLog);
+              if (!lastDataReceived || logTime > lastDataReceived) lastDataReceived = logTime;
+            }
+          });
+
+          // Determine status from multiple signals
+          let status, healthPct;
+          if (healthMatch) {
+            status = healthMatch.LastStatus || 'Unknown';
+            healthPct = parseFloat(healthMatch.HealthPct) || 0;
+          } else if (lastDataReceived) {
+            const minutesAgo = (Date.now() - lastDataReceived.getTime()) / 60000;
+            status = minutesAgo < 60 ? 'Active' : minutesAgo < 1440 ? 'Active' : 'Stale';
+            healthPct = status === 'Active' ? 100 : 50;
+          } else if (tables.length > 0) {
+            status = 'No Data';
+            healthPct = 0;
+          } else {
+            status = 'Unknown';
+            healthPct = null;
+          }
+
+          return {
+            name: displayName,
+            kind,
+            status,
+            healthPct,
+            failureCount: healthMatch ? parseInt(healthMatch.FailureCount) || 0 : 0,
+            successCount: healthMatch ? parseInt(healthMatch.SuccessCount) || 0 : 0,
+            lastChecked: healthMatch?.LastChecked || null,
+            lastDataReceived: lastDataReceived?.toISOString() || null,
+            tables: tableActivity,
+            hasHealthData: !!healthMatch,
+            enabled: c.properties?.dataTypes
+              ? Object.values(c.properties.dataTypes).some(dt =>
+                  dt?.state === 'Enabled' || dt?.state === 'enabled')
+              : true,
+          };
+        });
+
+        // Sort: failures first, then no-data, then active
+        merged.sort((a, b) => {
+          if (a.failureCount !== b.failureCount) return b.failureCount - a.failureCount;
+          if (a.status === 'No Data' && b.status !== 'No Data') return -1;
+          if (b.status === 'No Data' && a.status !== 'No Data') return 1;
+          return a.name.localeCompare(b.name);
+        });
+
+        setConnectorData(merged);
+        setConnectorTimeline(healthRows);
       } else if (tab === 'agents') {
         const agents = await runQuery(buildAgentHealthQuery(), `dch_agents_${wsKey}`, { throwOnError: false });
         setAgentData(agents?.error ? [] : agents);
@@ -844,65 +982,137 @@ function AnomaliesTab({ anomalyData, darkMode, cardClass, textPrimary, textSecon
 // ── Connectors Tab ───────────────────────────────────────────────────────────
 
 function ConnectorsTab({ connectorData, connectorTimeline, darkMode, cardClass, textPrimary, textSecondary, textMuted }) {
+  const [expandedRow, setExpandedRow] = useState(null);
+
   if (!connectorData) {
-    return <EmptyState message="Click 'Load Data' to view connector health. Note: SentinelHealth table must be enabled." darkMode={darkMode} />;
+    return <EmptyState message="Click 'Load Data' to view connector health." darkMode={darkMode} />;
   }
 
-  const healthy = connectorData.filter(r => r.LastStatus === 'Success' || parseFloat(r.HealthPct) >= 95);
-  const degraded = connectorData.filter(r => r.LastStatus !== 'Success' && parseFloat(r.HealthPct) >= 50 && parseFloat(r.HealthPct) < 95);
-  const unhealthy = connectorData.filter(r => parseFloat(r.HealthPct) < 50);
+  const active = connectorData.filter(r => r.status === 'Success' || r.status === 'Active');
+  const withIssues = connectorData.filter(r => r.status === 'Failure' || r.status === 'Stale' || r.status === 'No Data');
+  const withHealth = connectorData.filter(r => r.hasHealthData);
+
+  function getStatusColor(row) {
+    if (row.status === 'Success' || row.status === 'Active') return STATUS_COLORS.Healthy;
+    if (row.status === 'Failure' || row.status === 'No Data') return STATUS_COLORS.Critical;
+    if (row.status === 'Stale' || row.status === 'Warning') return STATUS_COLORS.Warning;
+    return '#6b7280';
+  }
+
+  function getStatusLabel(row) {
+    if (!row.enabled) return 'Disabled';
+    return row.status;
+  }
 
   return (
     <div className="space-y-6">
       {/* Summary */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <KpiCard label="Total Connectors" value={connectorData.length} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
-        <KpiCard label="Healthy" value={healthy.length} color="#10b981" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
-        <KpiCard label="Degraded" value={degraded.length} color="#f59e0b" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
-        <KpiCard label="Unhealthy" value={unhealthy.length} color="#ef4444" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Active" value={active.length} color="#10b981" darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Issues / No Data" value={withIssues.length} color={withIssues.length > 0 ? '#ef4444' : '#10b981'} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
+        <KpiCard label="Health Reporting" value={withHealth.length} subtitle={`of ${connectorData.length} report to SentinelHealth`} darkMode={darkMode} cardClass={cardClass} textPrimary={textPrimary} textSecondary={textSecondary} />
       </div>
 
       {connectorData.length === 0 ? (
         <div className={`${cardClass} p-8 text-center`}>
-          <p className={`font-medium ${textPrimary}`}>No Connector Health Data</p>
+          <p className={`font-medium ${textPrimary}`}>No Connectors Found</p>
           <p className={`text-sm mt-1 ${textSecondary}`}>
-            The SentinelHealth table may not be enabled in this workspace.
-            Enable diagnostic settings in Sentinel to start collecting connector health data.
+            No data connectors are configured in this Sentinel workspace.
           </p>
         </div>
       ) : (
         <div className={`${cardClass} p-5`}>
-          <h3 className={`text-sm font-semibold mb-4 ${textPrimary}`}>Connector Status</h3>
+          <h3 className={`text-sm font-semibold mb-4 ${textPrimary}`}>All Connectors ({connectorData.length})</h3>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className={`border-b ${darkMode ? 'border-gray-700' : 'border-gray-200'}`}>
                   <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Connector</th>
                   <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Status</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Last Data</th>
                   <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Health %</th>
                   <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Failures</th>
-                  <th className={`text-right py-2 px-3 font-medium ${textSecondary}`}>Successes</th>
-                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Last Checked</th>
+                  <th className={`text-left py-2 px-3 font-medium ${textSecondary}`}>Source</th>
                 </tr>
               </thead>
               <tbody>
                 {connectorData.map((row, i) => {
-                  const healthPct = parseFloat(row.HealthPct) || 0;
-                  const statusColor = healthPct >= 95 ? STATUS_COLORS.Healthy : healthPct >= 50 ? STATUS_COLORS.Warning : STATUS_COLORS.Critical;
+                  const statusColor = getStatusColor(row);
+                  const isExpanded = expandedRow === i;
                   return (
-                    <tr key={i} className={`border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-100'}`}>
-                      <td className={`py-2 px-3 font-medium ${textPrimary}`}>{row.SentinelResourceName}</td>
-                      <td className="py-2 px-3">
-                        <span className="flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: statusColor }} />
-                          <span className={textSecondary}>{row.LastStatus || 'Unknown'}</span>
-                        </span>
-                      </td>
-                      <td className={`py-2 px-3 text-right font-medium`} style={{ color: statusColor }}>{healthPct}%</td>
-                      <td className={`py-2 px-3 text-right ${row.FailureCount > 0 ? 'text-red-400' : textMuted}`}>{row.FailureCount}</td>
-                      <td className={`py-2 px-3 text-right ${textSecondary}`}>{row.SuccessCount}</td>
-                      <td className={`py-2 px-3 ${textMuted}`}>{timeAgo(row.LastChecked)}</td>
-                    </tr>
+                    <React.Fragment key={i}>
+                      <tr
+                        className={`border-b cursor-pointer transition-colors ${
+                          darkMode ? 'border-gray-700/50 hover:bg-gray-700/30' : 'border-gray-100 hover:bg-gray-50'
+                        }`}
+                        onClick={() => setExpandedRow(isExpanded ? null : i)}
+                      >
+                        <td className={`py-2 px-3 font-medium ${textPrimary}`}>
+                          <span className="flex items-center gap-2">
+                            <span className="text-xs">{isExpanded ? '▼' : '▶'}</span>
+                            {row.name}
+                          </span>
+                        </td>
+                        <td className="py-2 px-3">
+                          <span className="flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: row.enabled ? statusColor : '#6b7280' }} />
+                            <span className={textSecondary}>{getStatusLabel(row)}</span>
+                          </span>
+                        </td>
+                        <td className={`py-2 px-3 ${row.lastDataReceived ? textSecondary : textMuted}`}>
+                          {row.lastDataReceived ? timeAgo(row.lastDataReceived) : '—'}
+                        </td>
+                        <td className={`py-2 px-3 text-right font-medium`}>
+                          {row.healthPct != null ? (
+                            <span style={{ color: row.hasHealthData ? statusColor : textSecondary }}>{row.healthPct}%</span>
+                          ) : (
+                            <span className={textMuted}>—</span>
+                          )}
+                        </td>
+                        <td className={`py-2 px-3 text-right ${row.failureCount > 0 ? 'text-red-400' : textMuted}`}>
+                          {row.hasHealthData ? row.failureCount : '—'}
+                        </td>
+                        <td className={`py-2 px-3`}>
+                          <span className={`text-xs px-1.5 py-0.5 rounded ${
+                            row.hasHealthData
+                              ? darkMode ? 'bg-blue-500/10 text-blue-400' : 'bg-blue-50 text-blue-600'
+                              : darkMode ? 'bg-gray-700 text-gray-500' : 'bg-gray-100 text-gray-400'
+                          }`}>
+                            {row.hasHealthData ? 'Health + Usage' : 'Usage Only'}
+                          </span>
+                        </td>
+                      </tr>
+                      {isExpanded && (
+                        <tr className={darkMode ? 'bg-gray-800/50' : 'bg-gray-50/50'}>
+                          <td colSpan={6} className="px-6 py-3">
+                            <div className="space-y-2 text-xs">
+                              <div className="flex gap-6 flex-wrap">
+                                <span className={textMuted}>Kind: <span className={textSecondary}>{row.kind || '—'}</span></span>
+                                <span className={textMuted}>Enabled: <span className={row.enabled ? 'text-green-400' : 'text-red-400'}>{row.enabled ? 'Yes' : 'No'}</span></span>
+                                {row.lastChecked && <span className={textMuted}>Last Health Check: <span className={textSecondary}>{timeAgo(row.lastChecked)}</span></span>}
+                                {row.hasHealthData && <span className={textMuted}>Success: <span className={textSecondary}>{row.successCount}</span> | Failures: <span className={row.failureCount > 0 ? 'text-red-400' : textSecondary}>{row.failureCount}</span></span>}
+                              </div>
+                              {row.tables.length > 0 && (
+                                <div>
+                                  <span className={textMuted}>Associated Tables:</span>
+                                  <div className="flex gap-2 mt-1 flex-wrap">
+                                    {row.tables.map(t => (
+                                      <span key={t.table} className={`px-2 py-0.5 rounded ${darkMode ? 'bg-gray-700' : 'bg-gray-200'} ${textSecondary}`}>
+                                        {t.table}: {formatBytes(t.volumeGB)} — {timeAgo(t.lastLog)}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                              {row.tables.length === 0 && !row.hasHealthData && (
+                                <p className={textMuted}>No table mapping or health data available for this connector type.</p>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   );
                 })}
               </tbody>
