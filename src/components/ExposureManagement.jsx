@@ -23,9 +23,13 @@ const STATUS_STYLES = {
   'Remediated': { bg: 'bg-purple-500/15', text: 'text-purple-400', border: 'border-purple-500/30' },
 };
 
+const ANALYSTS = [
+  'Edward Blackshear', 'Jake', 'Tom', 'Regis',
+];
+
 const EMPTY_FORM = {
   client: '', ticket: '', date: '', status: 'Open', initiative: '',
-  scope: '', scoreBefore: '', scoreAfter: '', findings: '', actions: '', notes: '',
+  scope: '', scoreBefore: '', scoreAfter: '', findings: '', actions: '', notes: '', analyst: '',
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -135,11 +139,13 @@ export default function ExposureManagement({ darkMode }) {
       findings: entry.findings || '',
       actions: entry.actions || '',
       notes: entry.notes || '',
+      analyst: entry.analyst || '',
     });
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, []);
 
   const handleAdd = useCallback(async () => {
+    if (!form.analyst) { showToast('Select an analyst.', 'error'); return; }
     if (!form.client) { showToast('Select a client.', 'error'); return; }
     if (!form.date) { showToast('Enter a date.', 'error'); return; }
     setSaving(true);
@@ -165,6 +171,7 @@ export default function ExposureManagement({ darkMode }) {
   }, [form, clearForm, showToast]);
 
   const handleSaveEdit = useCallback(async () => {
+    if (!form.analyst) { showToast('Select an analyst.', 'error'); return; }
     if (!form.client) { showToast('Select a client.', 'error'); return; }
     if (!form.date) { showToast('Enter a date.', 'error'); return; }
     setSaving(true);
@@ -215,7 +222,7 @@ export default function ExposureManagement({ darkMode }) {
         if (filterClient && e.client !== filterClient) return false;
         if (filterStatus && e.status !== filterStatus) return false;
         if (filterMonth && !e.date.startsWith(filterMonth)) return false;
-        if (q && ![e.ticket, e.findings, e.actions, e.scope, e.notes, e.client, e.initiative]
+        if (q && ![e.ticket, e.findings, e.actions, e.scope, e.notes, e.client, e.initiative, e.analyst]
           .join(' ').toLowerCase().includes(q)) return false;
         return true;
       })
@@ -234,10 +241,10 @@ export default function ExposureManagement({ darkMode }) {
 
   const exportCSV = useCallback(() => {
     if (!filtered.length) { showToast('No entries to export.', 'error'); return; }
-    const headers = ['Date', 'Client', 'Ticket', 'Status', 'Score Before', 'Score After',
+    const headers = ['Date', 'Analyst', 'Client', 'Ticket', 'Status', 'Score Before', 'Score After',
       'Initiative', 'Scope', 'Recommendations Reviewed', 'Changes Made', 'Notes'];
     const rows = filtered.map(e =>
-      [e.date, e.client, e.ticket, e.status, e.scoreBefore, e.scoreAfter,
+      [e.date, e.analyst, e.client, e.ticket, e.status, e.scoreBefore, e.scoreAfter,
         e.initiative, e.scope, e.findings, e.actions, e.notes]
         .map(v => `"${String(v || '').replace(/"/g, '""')}"`)
         .join(',')
@@ -330,8 +337,15 @@ export default function ExposureManagement({ darkMode }) {
             {editingId ? 'Edit Entry' : 'Log New Entry'}
           </h2>
 
-          {/* Row 1: Client, Ticket, Date */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+          {/* Row 1: Analyst, Client, Ticket, Date */}
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+            <div>
+              <label className={labelClass}>Analyst</label>
+              <select value={form.analyst} onChange={e => updateField('analyst', e.target.value)} className={inputClass}>
+                <option value="">Select analyst...</option>
+                {ANALYSTS.map(a => <option key={a} value={a}>{a}</option>)}
+              </select>
+            </div>
             <div>
               <label className={labelClass}>Client</label>
               <select value={form.client} onChange={e => updateField('client', e.target.value)} className={inputClass}>
@@ -485,7 +499,7 @@ export default function ExposureManagement({ darkMode }) {
             <table className="w-full text-sm">
               <thead>
                 <tr className={darkMode ? 'bg-gray-700/50' : 'bg-gray-50'}>
-                  {['', 'Date', 'Client', 'Ticket', 'Status', 'Score', 'Initiative / Recommendation', 'Scope', 'Changes Made (preview)'].map(h => (
+                  {['', 'Date', 'Analyst', 'Client', 'Ticket', 'Status', 'Score', 'Initiative / Recommendation', 'Scope', 'Changes Made (preview)'].map(h => (
                     <th key={h} className={`px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider whitespace-nowrap ${
                       darkMode ? 'text-gray-400' : 'text-gray-500'
                     }`}>{h}</th>
@@ -495,7 +509,7 @@ export default function ExposureManagement({ darkMode }) {
               <tbody>
                 {filtered.length === 0 ? (
                   <tr>
-                    <td colSpan={9} className="text-center py-16">
+                    <td colSpan={10} className="text-center py-16">
                       <div className="text-4xl mb-3">{entries.length === 0 ? '📋' : '🔍'}</div>
                       <p className={`text-sm ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>
                         {entries.length === 0
@@ -526,6 +540,9 @@ export default function ExposureManagement({ darkMode }) {
                         <td className={`px-4 py-3 font-mono text-xs whitespace-nowrap ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
                           {entry.date}
                         </td>
+                        <td className={`px-4 py-3 text-xs font-semibold whitespace-nowrap ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                          {entry.analyst || <span className="text-gray-500">—</span>}
+                        </td>
                         <td className={`px-4 py-3 font-bold text-sm whitespace-nowrap ${darkMode ? 'text-white' : 'text-gray-900'}`}>
                           {entry.client}
                         </td>
@@ -553,7 +570,7 @@ export default function ExposureManagement({ darkMode }) {
                       <AnimatePresence>
                         {expandedId === entry.id && (
                           <tr>
-                            <td colSpan={9} className="p-0">
+                            <td colSpan={10} className="p-0">
                               <motion.div
                                 initial={{ opacity: 0, height: 0 }}
                                 animate={{ opacity: 1, height: 'auto' }}
@@ -565,6 +582,7 @@ export default function ExposureManagement({ darkMode }) {
                                   {/* Meta row */}
                                   <div className={`flex flex-wrap gap-8 mb-4 pb-4 border-b ${darkMode ? 'border-gray-700/50' : 'border-gray-200'}`}>
                                     {[
+                                      { label: 'Analyst', value: entry.analyst || '—' },
                                       { label: 'Client', value: entry.client },
                                       { label: 'Date', value: entry.date, mono: true },
                                       { label: 'Ticket', value: entry.ticket, mono: true },
