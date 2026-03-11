@@ -159,6 +159,13 @@ try {
   console.error('✗ GenerateDetermination failed:', e.message, e.stack);
 }
 
+try {
+  require('./ExposureManagementAPI');
+  console.log('✓ ExposureManagementAPI loaded');
+} catch (e) {
+  console.error('✗ ExposureManagementAPI failed:', e.message, e.stack);
+}
+
 console.log('========================================');
 console.log('All Azure Functions modules loaded');
 console.log('Total modules in cache:', Object.keys(require.cache).length);

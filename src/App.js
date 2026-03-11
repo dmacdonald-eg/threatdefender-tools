@@ -17,6 +17,7 @@ const Resources = lazy(() => import('./components/Resources'));
 const DeterminationGenerator = lazy(() => import('./components/DeterminationGenerator'));
 const MonthlyReportDashboard = lazy(() => import('./components/MonthlyReportDashboard'));
 const DataCollectionHealth = lazy(() => import('./components/DataCollectionHealth'));
+const ExposureManagement = lazy(() => import('./components/ExposureManagement'));
 
 // Loading component
 function LoadingFallback({ darkMode }) {
@@ -59,6 +60,7 @@ export default function ThreatDefenderDashboard() {
     { id: 'determination-generator', name: 'Determination Generator', icon: '📝', component: DeterminationGenerator },
     { id: 'monthly-report', name: 'Monthly Report', icon: '📊', component: MonthlyReportDashboard },
     { id: 'data-health', name: 'Data Collection Health', icon: '🔌', component: DataCollectionHealth },
+    { id: 'exposure-mgmt', name: 'Exposure Management', icon: '🛡️', component: ExposureManagement },
     { id: 'resources', name: 'Resources', icon: '🔗', component: Resources },
   ];
 
@@ -165,6 +167,14 @@ export default function ThreatDefenderDashboard() {
                 element={
                   <PageWrapper darkMode={darkMode}>
                     <DataCollectionHealth darkMode={darkMode} />
+                  </PageWrapper>
+                }
+              />
+              <Route
+                path="/exposure-mgmt"
+                element={
+                  <PageWrapper darkMode={darkMode}>
+                    <ExposureManagement darkMode={darkMode} />
                   </PageWrapper>
                 }
               />

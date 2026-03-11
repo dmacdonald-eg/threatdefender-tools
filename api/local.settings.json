@@ -10,6 +10,7 @@
     "PROMPT_RUNS_TABLE_NAME": "PromptRuns",
     "AZURE_OPENAI_ENDPOINT": "",
     "AZURE_OPENAI_API_KEY": "",
-    "AZURE_OPENAI_DEPLOYMENT": "gpt-4"
+    "AZURE_OPENAI_DEPLOYMENT": "gpt-4",
+    "EXPOSURE_TABLE_NAME": "ExposureManagement"
   }
 }
