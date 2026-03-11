@@ -23,10 +23,6 @@ const STATUS_STYLES = {
   'Remediated': { bg: 'bg-purple-500/15', text: 'text-purple-400', border: 'border-purple-500/30' },
 };
 
-const ANALYSTS = [
-  'Edward Blackshear', 'Jake', 'Tom', 'Regis',
-];
-
 const EMPTY_FORM = {
   client: '', ticket: '', date: '', status: 'Open', initiative: '',
   scope: '', scoreBefore: '', scoreAfter: '', findings: '', actions: '', notes: '', analyst: '',
@@ -237,6 +233,11 @@ export default function ExposureManagement({ darkMode }) {
     open: entries.filter(e => e.status === 'Open' || e.status === 'In Progress').length,
   }), [entries]);
 
+  // Derive unique analyst names from existing entries for autocomplete
+  const knownAnalysts = useMemo(() =>
+    [...new Set(entries.map(e => e.analyst).filter(Boolean))].sort(),
+  [entries]);
+
   // ── CSV Export ──────────────────────────────────────────────────────────
 
   const exportCSV = useCallback(() => {
@@ -341,10 +342,12 @@ export default function ExposureManagement({ darkMode }) {
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
             <div>
               <label className={labelClass}>Analyst</label>
-              <select value={form.analyst} onChange={e => updateField('analyst', e.target.value)} className={inputClass}>
-                <option value="">Select analyst...</option>
-                {ANALYSTS.map(a => <option key={a} value={a}>{a}</option>)}
-              </select>
+              <input type="text" list="analyst-suggestions" value={form.analyst}
+                onChange={e => updateField('analyst', e.target.value)}
+                placeholder="Type your name..." className={inputClass} />
+              <datalist id="analyst-suggestions">
+                {knownAnalysts.map(a => <option key={a} value={a} />)}
+              </datalist>
             </div>
             <div>
               <label className={labelClass}>Client</label>

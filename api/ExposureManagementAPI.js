@@ -172,6 +172,7 @@ async function listEntries(request, context) {
       findings: e.findings || '',
       actions: e.actions || '',
       notes: e.notes || '',
+      analyst: e.analyst || '',
       createdBy: e.createdBy || 'system',
       createdAt: e.createdAt || '',
       updatedBy: e.updatedBy || '',
@@ -211,6 +212,7 @@ async function getEntry(request, context, id) {
       status: e.status, initiative: e.initiative, scope: e.scope,
       scoreBefore: e.scoreBefore, scoreAfter: e.scoreAfter,
       findings: e.findings, actions: e.actions, notes: e.notes,
+      analyst: e.analyst || '',
       createdBy: e.createdBy, createdAt: e.createdAt,
       updatedBy: e.updatedBy, updatedAt: e.updatedAt,
     }
@@ -246,6 +248,7 @@ async function createEntry(request, context) {
     findings: body.findings || '',
     actions: body.actions || '',
     notes: body.notes || '',
+    analyst: body.analyst || '',
     createdBy: user,
     createdAt: now,
     updatedBy: '',
@@ -270,6 +273,7 @@ async function createEntry(request, context) {
         status: entity.status, initiative: entity.initiative, scope: entity.scope,
         scoreBefore: entity.scoreBefore, scoreAfter: entity.scoreAfter,
         findings: entity.findings, actions: entity.actions, notes: entity.notes,
+        analyst: entity.analyst,
         createdBy: entity.createdBy, createdAt: entity.createdAt,
         updatedBy: '', updatedAt: '',
       }
@@ -309,6 +313,7 @@ async function updateEntry(request, context, id) {
     findings: body.findings !== undefined ? body.findings : existing.findings,
     actions: body.actions !== undefined ? body.actions : existing.actions,
     notes: body.notes !== undefined ? body.notes : existing.notes,
+    analyst: body.analyst !== undefined ? body.analyst : existing.analyst,
     updatedBy: user,
     updatedAt: now,
   };
@@ -331,6 +336,7 @@ async function updateEntry(request, context, id) {
         status: updated.status, initiative: updated.initiative, scope: updated.scope,
         scoreBefore: updated.scoreBefore, scoreAfter: updated.scoreAfter,
         findings: updated.findings, actions: updated.actions, notes: updated.notes,
+        analyst: updated.analyst || '',
         createdBy: updated.createdBy, createdAt: updated.createdAt,
         updatedBy: updated.updatedBy, updatedAt: updated.updatedAt,
       }
