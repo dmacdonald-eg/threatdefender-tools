@@ -344,12 +344,23 @@ export default function ExposureManagement({ darkMode }) {
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
             <div>
               <label className={labelClass}>Analyst</label>
-              <input type="text" list="analyst-suggestions" value={form.analyst}
-                onChange={e => updateField('analyst', e.target.value)}
-                placeholder="Type your name..." className={inputClass} />
-              <datalist id="analyst-suggestions">
-                {knownAnalysts.map(a => <option key={a} value={a} />)}
-              </datalist>
+              <select
+                value={knownAnalysts.includes(form.analyst) ? form.analyst : (form.analyst ? '__other__' : '')}
+                onChange={e => {
+                  if (e.target.value === '__other__') updateField('analyst', '');
+                  else updateField('analyst', e.target.value);
+                }}
+                className={inputClass}
+              >
+                <option value="">Select analyst...</option>
+                {knownAnalysts.map(a => <option key={a} value={a}>{a}</option>)}
+                <option value="__other__">Other...</option>
+              </select>
+              {form.analyst !== '' && !knownAnalysts.includes(form.analyst) && (
+                <input type="text" value={form.analyst}
+                  onChange={e => updateField('analyst', e.target.value)}
+                  placeholder="Enter name..." className={`${inputClass} mt-1`} autoFocus />
+              )}
             </div>
             <div>
               <label className={labelClass}>Client</label>
