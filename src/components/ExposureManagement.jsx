@@ -16,6 +16,8 @@ const CLIENTS = [
 
 const STATUSES = ['Open', 'In Progress', 'Closed', 'Remediated'];
 
+const SEED_ANALYSTS = ['Edward Blackshear', 'Derek MacDonald', 'Darkenstz Corneille'];
+
 const STATUS_STYLES = {
   'Open': { bg: 'bg-red-500/15', text: 'text-red-400', border: 'border-red-500/30' },
   'In Progress': { bg: 'bg-yellow-500/15', text: 'text-yellow-400', border: 'border-yellow-500/30' },
@@ -235,7 +237,7 @@ export default function ExposureManagement({ darkMode }) {
 
   // Derive unique analyst names from existing entries for autocomplete
   const knownAnalysts = useMemo(() =>
-    [...new Set(entries.map(e => e.analyst).filter(Boolean))].sort(),
+    [...new Set([...SEED_ANALYSTS, ...entries.map(e => e.analyst).filter(Boolean)])].sort(),
   [entries]);
 
   // ── CSV Export ──────────────────────────────────────────────────────────
