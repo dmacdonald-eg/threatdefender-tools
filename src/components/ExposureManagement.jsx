@@ -80,6 +80,7 @@ export default function ExposureManagement({ darkMode }) {
   const [filterStatus, setFilterStatus] = useState('');
   const [filterMonth, setFilterMonth] = useState('');
   const [filterSearch, setFilterSearch] = useState('');
+  const [filterAnalyst, setFilterAnalyst] = useState('');
 
   // Toast state
   const [toast, setToast] = useState(null);
@@ -219,13 +220,14 @@ export default function ExposureManagement({ darkMode }) {
       .filter(e => {
         if (filterClient && e.client !== filterClient) return false;
         if (filterStatus && e.status !== filterStatus) return false;
+        if (filterAnalyst && e.analyst !== filterAnalyst) return false;
         if (filterMonth && !e.date.startsWith(filterMonth)) return false;
         if (q && ![e.ticket, e.findings, e.actions, e.scope, e.notes, e.client, e.initiative, e.analyst]
           .join(' ').toLowerCase().includes(q)) return false;
         return true;
       })
       .sort((a, b) => new Date(b.date) - new Date(a.date));
-  }, [entries, filterClient, filterStatus, filterMonth, filterSearch]);
+  }, [entries, filterClient, filterStatus, filterAnalyst, filterMonth, filterSearch]);
 
   // ── Stats ───────────────────────────────────────────────────────────────
 
@@ -500,6 +502,11 @@ export default function ExposureManagement({ darkMode }) {
             className={`${inputClass} flex-1 min-w-[140px]`}>
             <option value="">All Statuses</option>
             {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <select value={filterAnalyst} onChange={e => setFilterAnalyst(e.target.value)}
+            className={`${inputClass} flex-1 min-w-[140px]`}>
+            <option value="">All Analysts</option>
+            {knownAnalysts.map(a => <option key={a} value={a}>{a}</option>)}
           </select>
           <input type="month" value={filterMonth} onChange={e => setFilterMonth(e.target.value)}
             className={`${inputClass} flex-1 min-w-[140px]`} title="Filter by month" />
