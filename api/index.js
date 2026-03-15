@@ -166,6 +166,13 @@ try {
   console.error('✗ ExposureManagementAPI failed:', e.message, e.stack);
 }
 
+try {
+  require('./SoarExecute');
+  console.log('✓ SoarExecute loaded');
+} catch (e) {
+  console.error('✗ SoarExecute failed:', e.message, e.stack);
+}
+
 console.log('========================================');
 console.log('All Azure Functions modules loaded');
 console.log('Total modules in cache:', Object.keys(require.cache).length);

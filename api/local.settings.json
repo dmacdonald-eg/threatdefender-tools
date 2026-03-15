@@ -11,6 +11,8 @@
     "AZURE_OPENAI_ENDPOINT": "",
     "AZURE_OPENAI_API_KEY": "",
     "AZURE_OPENAI_DEPLOYMENT": "gpt-4",
-    "EXPOSURE_TABLE_NAME": "ExposureManagement"
+    "EXPOSURE_TABLE_NAME": "ExposureManagement",
+    "SOAR_CLIENT_ID": "",
+    "SOAR_CLIENT_SECRET": ""
   }
 }

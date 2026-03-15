@@ -193,9 +193,13 @@ export function AuthProvider({ children }) {
     const subscriptions = subsResponse.value || [];
     const subscriptionIds = subscriptions.map(s => s.subscriptionId);
 
-    // Build subscription lookup for display names
+    // Build subscription lookup for display names and tenant IDs
     const subLookup = {};
-    subscriptions.forEach(s => { subLookup[s.subscriptionId] = s.displayName; });
+    const subTenantLookup = {};
+    subscriptions.forEach(s => {
+      subLookup[s.subscriptionId] = s.displayName;
+      if (s.tenantId) subTenantLookup[s.subscriptionId] = s.tenantId;
+    });
 
     // Use Azure Resource Graph to find all Sentinel-enabled workspaces in one query
     const resourceGraphQuery = {
@@ -237,6 +241,7 @@ export function AuthProvider({ children }) {
           location: wsResponse.location,
           subscriptionId,
           subscriptionName: subLookup[subscriptionId] || subscriptionId,
+          tenantId: subTenantLookup[subscriptionId] || null,
           resourceGroup: wsResponse.id.split('/resourceGroups/')[1]?.split('/')[0],
         };
       }

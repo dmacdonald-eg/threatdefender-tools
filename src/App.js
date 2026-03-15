@@ -18,6 +18,7 @@ const DeterminationGenerator = lazy(() => import('./components/DeterminationGene
 const MonthlyReportDashboard = lazy(() => import('./components/MonthlyReportDashboard'));
 const DataCollectionHealth = lazy(() => import('./components/DataCollectionHealth'));
 const ExposureManagement = lazy(() => import('./components/ExposureManagement'));
+const SOARActions = lazy(() => import('./components/SOARActions'));
 
 // Loading component
 function LoadingFallback({ darkMode }) {
@@ -59,6 +60,7 @@ export default function ThreatDefenderDashboard() {
     { id: 'email-headers', name: 'Email Header Analyzer', icon: '🔬', component: EmailHeaderAnalyzer },
     { id: 'determination-generator', name: 'Determination Generator', icon: '📝', component: DeterminationGenerator },
     { id: 'monthly-report', name: 'Monthly Report', icon: '📊', component: MonthlyReportDashboard },
+    { id: 'soar-actions', name: 'SOAR Actions', icon: '⚡', component: SOARActions },
     { id: 'data-health', name: 'Data Collection Health', icon: '🔌', component: DataCollectionHealth },
     { id: 'exposure-mgmt', name: 'Exposure Management', icon: '🛡️', component: ExposureManagement },
     { id: 'resources', name: 'Resources', icon: '🔗', component: Resources },
@@ -159,6 +161,14 @@ export default function ThreatDefenderDashboard() {
                 element={
                   <PageWrapper darkMode={darkMode}>
                     <MonthlyReportDashboard darkMode={darkMode} />
+                  </PageWrapper>
+                }
+              />
+              <Route
+                path="/soar-actions"
+                element={
+                  <PageWrapper darkMode={darkMode}>
+                    <SOARActions darkMode={darkMode} />
                   </PageWrapper>
                 }
               />
